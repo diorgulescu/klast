@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
-      AR_x86_64_unknown_linux_musl: x86_64-linux-musl-ar
+      AR_x86_64_unknown_linux_musl: ar
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-gcc
     steps:
       - name: Checkout repository

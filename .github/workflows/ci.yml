@@ -83,7 +83,7 @@ jobs:
 
     env:
       CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
-      AR_x86_64_unknown_linux_musl: x86_64-linux-musl-ar
+      AR_x86_64_unknown_linux_musl: ar
       CC_i686_unknown_linux_musl: i686-linux-gnu-gcc
       AR_i686_unknown_linux_musl: i686-linux-gnu-ar
       CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
