@@ -87,7 +87,7 @@ impl NetworkClient {
 /// - `en.wikipedia.org` -> `en.m.wikipedia.org`
 /// - Strips tracking query parameters (`utm_source`, `utm_medium`, `utm_campaign`, `fbclid`, `gclid`).
 pub fn rewrite_url(raw_url: &str, smart_redirects: bool) -> String {
-    if !smart_redirects || raw_url.starts_with("about:") {
+    if !smart_redirects || raw_url.starts_with("about:") || raw_url.starts_with("file://") {
         return raw_url.to_string();
     }
 
@@ -167,7 +167,7 @@ pub fn normalize_input_to_url(input: &str) -> String {
         return "about:welcome".to_string();
     }
 
-    if trimmed.starts_with("about:") {
+    if trimmed.starts_with("about:") || trimmed.starts_with("file://") {
         return trimmed.to_string();
     }
 

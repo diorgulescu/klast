@@ -805,6 +805,274 @@ fn flush_paragraph(spans: &mut Vec<InlineSpan>, out: &mut Vec<DomNode>) {
     }
 }
 
+/// Parses a plain-text Markdown document into a native `Vec<DomNode>` AST.
+/// Supports `#` headings, `- ` / `* ` lists, `> ` quotes, fenced code blocks,
+/// horizontal rules (`---`), and inline `[Title](url)`, `` `code` ``, `**bold**`, and `*italic*`.
+pub fn parse_markdown_to_dom(md: &str) -> Vec<DomNode> {
+    let mut nodes: Vec<DomNode> = Vec::new();
+    let mut in_code_block = false;
+    let mut code_buf = String::new();
+    let mut list_buf: Vec<Vec<InlineSpan>> = Vec::new();
+    let mut quote_buf: Vec<String> = Vec::new();
+    let mut para_lines: Vec<String> = Vec::new();
+
+    let flush_all = |list_buf: &mut Vec<Vec<InlineSpan>>,
+                     quote_buf: &mut Vec<String>,
+                     para_lines: &mut Vec<String>,
+                     nodes: &mut Vec<DomNode>| {
+        if !para_lines.is_empty() {
+            let joined = para_lines.join(" ");
+            para_lines.clear();
+            let spans = parse_markdown_inline(&joined);
+            if !spans.is_empty() {
+                nodes.push(DomNode::Paragraph(spans));
+            }
+        }
+        if !list_buf.is_empty() {
+            nodes.push(DomNode::List(std::mem::take(list_buf)));
+        }
+        if !quote_buf.is_empty() {
+            let joined = quote_buf.join(" ");
+            quote_buf.clear();
+            if !joined.is_empty() {
+                nodes.push(DomNode::Quote(joined));
+            }
+        }
+    };
+
+    for raw_line in md.lines() {
+        let trimmed_end = raw_line.trim_end();
+        let trimmed = trimmed_end.trim_start();
+
+        if trimmed.starts_with("```") {
+            flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
+            if in_code_block {
+                let cleaned = code_buf.trim_end_matches('\n').to_string();
+                nodes.push(DomNode::CodeBlock(cleaned));
+                code_buf.clear();
+                in_code_block = false;
+            } else {
+                in_code_block = true;
+            }
+            continue;
+        }
+
+        if in_code_block {
+            code_buf.push_str(raw_line);
+            code_buf.push('\n');
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
+            continue;
+        }
+
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
+            nodes.push(DomNode::HorizontalRule);
+            continue;
+        }
+
+        if trimmed.starts_with('#') {
+            let hash_count = trimmed.chars().take_while(|&c| c == '#').count();
+            if (1..=6).contains(&hash_count) {
+                let rest = trimmed[hash_count..].trim();
+                if !rest.is_empty() {
+                    flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
+                    nodes.push(DomNode::Heading(hash_count as u8, rest.to_string()));
+                    continue;
+                }
+            }
+        }
+
+        if let Some(item_str) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            if !para_lines.is_empty() || !quote_buf.is_empty() {
+                flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
+            }
+            let item_spans = parse_markdown_inline(item_str.trim());
+            if !item_spans.is_empty() {
+                list_buf.push(item_spans);
+            }
+            continue;
+        }
+
+        if let Some(quote_line) = trimmed
+            .strip_prefix("> ")
+            .or_else(|| trimmed.strip_prefix('>'))
+        {
+            if !para_lines.is_empty() || !list_buf.is_empty() {
+                flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
+            }
+            let clean_quote = quote_line.trim();
+            if !clean_quote.is_empty() {
+                quote_buf.push(clean_quote.to_string());
+            }
+            continue;
+        }
+
+        if !list_buf.is_empty() || !quote_buf.is_empty() {
+            flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
+        }
+        para_lines.push(trimmed.to_string());
+    }
+
+    if in_code_block && !code_buf.is_empty() {
+        nodes.push(DomNode::CodeBlock(code_buf.trim_end_matches('\n').to_string()));
+    }
+    flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
+
+    nodes
+}
+
+fn parse_markdown_inline(input: &str) -> Vec<InlineSpan> {
+    let mut spans: Vec<InlineSpan> = Vec::new();
+    let mut text_buf = String::new();
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    let flush_text = |text_buf: &mut String, spans: &mut Vec<InlineSpan>| {
+        if !text_buf.is_empty() {
+            spans.push(InlineSpan::Text(std::mem::take(text_buf)));
+        }
+    };
+
+    while i < len {
+        // Check for ![alt](url) image syntax
+        if chars[i] == '!' && i + 1 < len && chars[i + 1] == '[' {
+            if let Some((alt, url, next_idx)) = try_parse_link(&chars, i + 1) {
+                flush_text(&mut text_buf, &mut spans);
+                spans.push(InlineSpan::ImageBadge { alt, url });
+                i = next_idx;
+                continue;
+            }
+        }
+
+        // Check for [text](url) link syntax
+        if chars[i] == '[' {
+            if let Some((label, href, next_idx)) = try_parse_link(&chars, i) {
+                flush_text(&mut text_buf, &mut spans);
+                if let Some(alt) = label.strip_prefix("IMG: ") {
+                    spans.push(InlineSpan::ImageBadge {
+                        alt: alt.to_string(),
+                        url: href,
+                    });
+                } else {
+                    spans.push(InlineSpan::Link { text: label, href });
+                }
+                i = next_idx;
+                continue;
+            }
+        }
+
+        // Check for `code`
+        if chars[i] == '`' {
+            if let Some((code_str, next_idx)) = try_parse_delimited(&chars, i + 1, '`') {
+                flush_text(&mut text_buf, &mut spans);
+                spans.push(InlineSpan::Code(code_str));
+                i = next_idx;
+                continue;
+            }
+        }
+
+        // Check for **bold**
+        if chars[i] == '*' && i + 1 < len && chars[i + 1] == '*' {
+            if let Some((bold_str, next_idx)) = try_parse_double_asterisk(&chars, i + 2) {
+                flush_text(&mut text_buf, &mut spans);
+                spans.push(InlineSpan::Bold(bold_str));
+                i = next_idx;
+                continue;
+            }
+        }
+
+        // Check for *italic*
+        if chars[i] == '*' {
+            if let Some((italic_str, next_idx)) = try_parse_delimited(&chars, i + 1, '*') {
+                flush_text(&mut text_buf, &mut spans);
+                spans.push(InlineSpan::Italic(italic_str));
+                i = next_idx;
+                continue;
+            }
+        }
+
+        text_buf.push(chars[i]);
+        i += 1;
+    }
+
+    flush_text(&mut text_buf, &mut spans);
+    spans
+}
+
+fn try_parse_link(chars: &[char], start_bracket: usize) -> Option<(String, String, usize)> {
+    let len = chars.len();
+    let mut close_bracket = None;
+    for (idx, &ch) in chars.iter().enumerate().skip(start_bracket + 1) {
+        if ch == ']' {
+            close_bracket = Some(idx);
+            break;
+        }
+    }
+    let close_b = close_bracket?;
+    if close_b + 1 >= len || chars[close_b + 1] != '(' {
+        return None;
+    }
+
+    let mut close_paren = None;
+    let mut paren_depth = 0usize;
+    for (idx, &ch) in chars.iter().enumerate().skip(close_b + 2) {
+        if ch == '(' {
+            paren_depth += 1;
+        } else if ch == ')' {
+            if paren_depth == 0 {
+                close_paren = Some(idx);
+                break;
+            }
+            paren_depth -= 1;
+        }
+    }
+    let close_p = close_paren?;
+
+    let label: String = chars[start_bracket + 1..close_b].iter().collect();
+    let url: String = chars[close_b + 2..close_p].iter().collect();
+    if label.is_empty() || url.trim().is_empty() {
+        return None;
+    }
+    Some((label, url.trim().to_string(), close_p + 1))
+}
+
+fn try_parse_delimited(chars: &[char], start: usize, delimiter: char) -> Option<(String, usize)> {
+    for (idx, &ch) in chars.iter().enumerate().skip(start) {
+        if ch == delimiter {
+            let content: String = chars[start..idx].iter().collect();
+            if !content.is_empty() {
+                return Some((content, idx + 1));
+            }
+            return None;
+        }
+    }
+    None
+}
+
+fn try_parse_double_asterisk(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let len = chars.len();
+    let mut idx = start;
+    while idx + 1 < len {
+        if chars[idx] == '*' && chars[idx + 1] == '*' {
+            let content: String = chars[start..idx].iter().collect();
+            if !content.is_empty() {
+                return Some((content, idx + 2));
+            }
+            return None;
+        }
+        idx += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

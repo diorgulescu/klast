@@ -2,6 +2,7 @@ mod adblock_filter;
 mod app;
 mod dom;
 mod net;
+mod storage;
 mod webview_fallback;
 
 use app::KlastApp;
