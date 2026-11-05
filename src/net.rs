@@ -1,3 +1,5 @@
+use crate::adblock_filter::AdblockFilter;
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -5,20 +7,14 @@ use url::Url;
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
-const BLOCKED_DOMAINS: &[&str] = &[
-    "doubleclick.net",
-    "googlesyndication.com",
-    "google-analytics.com",
-    "googletagmanager.com",
-    "adservice.google.com",
-    "connect.facebook.net",
-    "analytics.twitter.com",
-    "scorecardresearch.com",
-    "zedo.com",
-    "adnxs.com",
-    "criteo.com",
-    "outbrain.com",
-    "taboola.com",
+const TRACKING_PARAMS: &[&str] = &[
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "fbclid",
+    "gclid",
 ];
 
 #[derive(Debug, Clone)]
@@ -33,6 +29,8 @@ pub struct FetchResponse {
 pub enum FetchResult {
     Success(FetchResponse),
     Error { url: String, error: String },
+    ImageLoaded { url: String, rgba: Vec<u8>, width: usize, height: usize },
+    ImageFailed { url: String, error: String },
 }
 
 pub struct NetworkClient {
@@ -52,24 +50,113 @@ impl NetworkClient {
         Self { tx, rx }
     }
 
-    /// Triggers a non-blocking HTTP GET on a background thread.
-    pub fn fetch(&self, raw_input: &str) -> String {
-        let target_url = normalize_input_to_url(raw_input);
+    /// Triggers a non-blocking HTTP GET on a background thread, applying smart redirects if enabled.
+    pub fn fetch(&self, raw_input: &str, smart_redirects: bool) -> String {
+        let normalized = normalize_input_to_url(raw_input);
+        let target_url = rewrite_url(&normalized, smart_redirects);
         let tx = self.tx.clone();
         let url_for_thread = target_url.clone();
 
         thread::spawn(move || {
-            let result = perform_request(&url_for_thread);
+            let result = perform_request(&url_for_thread, smart_redirects);
             let _ = tx.send(result);
         });
 
         target_url
     }
 
+    /// Triggers a non-blocking image download and decode on a background thread.
+    pub fn fetch_image(&self, image_url: &str) {
+        let tx = self.tx.clone();
+        let url_for_thread = image_url.to_string();
+
+        thread::spawn(move || {
+            let result = perform_image_request(&url_for_thread);
+            let _ = tx.send(result);
+        });
+    }
+
     /// Polls for completed network responses without blocking the UI thread.
     pub fn poll(&self) -> Option<FetchResult> {
         self.rx.try_recv().ok()
     }
+}
+
+/// Applies privacy and low-bloat URL rewrites:
+/// - `www.reddit.com` / `reddit.com` -> `old.reddit.com`
+/// - `en.wikipedia.org` -> `en.m.wikipedia.org`
+/// - Strips tracking query parameters (`utm_source`, `utm_medium`, `utm_campaign`, `fbclid`, `gclid`).
+pub fn rewrite_url(raw_url: &str, smart_redirects: bool) -> String {
+    if !smart_redirects || raw_url.starts_with("about:") {
+        return raw_url.to_string();
+    }
+
+    let Ok(mut parsed) = Url::parse(raw_url) else {
+        return raw_url.to_string();
+    };
+
+    if let Some(host) = parsed.host_str().map(|h| h.to_ascii_lowercase()) {
+        match host.as_str() {
+            "reddit.com" | "www.reddit.com" => {
+                let _ = parsed.set_host(Some("old.reddit.com"));
+            }
+            "en.wikipedia.org" => {
+                let _ = parsed.set_host(Some("en.m.wikipedia.org"));
+            }
+            _ => {}
+        }
+    }
+
+    // Strip common tracking query parameters while keeping legitimate query parameters intact.
+    let existing_pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    if !existing_pairs.is_empty() {
+        let filtered: Vec<(String, String)> = existing_pairs
+            .into_iter()
+            .filter(|(k, _)| {
+                let key_lower = k.to_ascii_lowercase();
+                !TRACKING_PARAMS.contains(&key_lower.as_str())
+            })
+            .collect();
+
+        if filtered.is_empty() {
+            parsed.set_query(None);
+        } else {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            for (k, v) in &filtered {
+                serializer.append_pair(k, v);
+            }
+            let new_query = serializer.finish();
+            parsed.set_query(Some(&new_query));
+        }
+    }
+
+    parsed.to_string()
+}
+
+/// Constructs a GET form target URL by combining the resolved form `action` URL
+/// with hidden fields and user-entered form values.
+pub fn build_get_form_url(
+    action_url: &str,
+    field_names: &[(String, String)],
+    user_values: &HashMap<String, String>,
+) -> Option<String> {
+    let mut parsed = Url::parse(action_url).ok()?;
+    {
+        let mut query_pairs = parsed.query_pairs_mut();
+        query_pairs.clear();
+        for (field_key, name) in field_names {
+            if name.is_empty() {
+                continue;
+            }
+            let val = user_values.get(field_key).map(String::as_str).unwrap_or("");
+            query_pairs.append_pair(name, val);
+        }
+    }
+    Some(parsed.to_string())
 }
 
 /// Converts raw address bar input into either an internal `about:` URL,
@@ -108,7 +195,7 @@ pub fn normalize_input_to_url(input: &str) -> String {
     }
 }
 
-/// Resolves a potentially relative `href` against a base URL.
+/// Resolves a potentially relative `href` or `action` or `src` against a base URL.
 pub fn resolve_url(base_url: Option<&Url>, href: &str) -> Option<String> {
     let trimmed = href.trim();
     if trimmed.is_empty()
@@ -137,21 +224,7 @@ pub fn resolve_url(base_url: Option<&Url>, href: &str) -> Option<String> {
     None
 }
 
-/// Checks if a URL belongs to a known ad or tracker domain.
-pub fn is_blocked_url(raw_url: &str) -> bool {
-    let Ok(parsed) = Url::parse(raw_url) else {
-        return false;
-    };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    let host_lower = host.to_ascii_lowercase();
-    BLOCKED_DOMAINS
-        .iter()
-        .any(|domain| host_lower == *domain || host_lower.ends_with(&format!(".{domain}")))
-}
-
-fn perform_request(target_url: &str) -> FetchResult {
+fn perform_request(target_url: &str, smart_redirects: bool) -> FetchResult {
     if target_url.starts_with("about:") {
         let html = build_internal_page(target_url);
         let bytes_received = html.len();
@@ -163,10 +236,11 @@ fn perform_request(target_url: &str) -> FetchResult {
         });
     }
 
-    if is_blocked_url(target_url) {
+    let filter = AdblockFilter::new();
+    if filter.should_block_url(target_url, target_url, "document") {
         return FetchResult::Error {
             url: target_url.to_string(),
-            error: "Blocked by Klast URL-level ad/tracker filter.".to_string(),
+            error: "Blocked by Klast adblock-rust engine.".to_string(),
         };
     }
 
@@ -209,7 +283,7 @@ fn perform_request(target_url: &str) -> FetchResult {
         status_code,
         response.status().canonical_reason().unwrap_or("OK")
     );
-    let final_url = response.url().to_string();
+    let final_url = rewrite_url(response.url().as_str(), smart_redirects);
 
     match response.text() {
         Ok(body) => {
@@ -228,6 +302,59 @@ fn perform_request(target_url: &str) -> FetchResult {
     }
 }
 
+fn perform_image_request(image_url: &str) -> FetchResult {
+    let client = match reqwest::blocking::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return FetchResult::ImageFailed {
+                url: image_url.to_string(),
+                error: e.to_string(),
+            }
+        }
+    };
+
+    let resp = match client.get(image_url).send() {
+        Ok(r) => r,
+        Err(e) => {
+            return FetchResult::ImageFailed {
+                url: image_url.to_string(),
+                error: e.to_string(),
+            }
+        }
+    };
+
+    let bytes = match resp.bytes() {
+        Ok(b) => b,
+        Err(e) => {
+            return FetchResult::ImageFailed {
+                url: image_url.to_string(),
+                error: e.to_string(),
+            }
+        }
+    };
+
+    match image::load_from_memory(&bytes) {
+        Ok(decoded) => {
+            let rgba_img = decoded.to_rgba8();
+            let (w, h) = rgba_img.dimensions();
+            FetchResult::ImageLoaded {
+                url: image_url.to_string(),
+                rgba: rgba_img.into_raw(),
+                width: w as usize,
+                height: h as usize,
+            }
+        }
+        Err(e) => FetchResult::ImageFailed {
+            url: image_url.to_string(),
+            error: format!("Image decode error: {e}"),
+        },
+    }
+}
+
 pub fn build_internal_page(about_url: &str) -> String {
     match about_url {
         "about:welcome" | _ => r#"<!DOCTYPE html>
@@ -239,27 +366,57 @@ pub fn build_internal_page(about_url: &str) -> String {
     <main>
         <h1>Klast — Ultra-Lightweight Hybrid Web Browser</h1>
         <p>Welcome to <strong>Klast</strong>, a fast, non-bloated, text-first web browser built in Rust for low-resource systems and distraction-free reading.</p>
+        <form action="https://html.duckduckgo.com/html/" method="get">
+            <input type="search" name="q" placeholder="Search the web via DuckDuckGo HTML..." value="" />
+            <button type="submit">Search Web</button>
+        </form>
         <hr />
         <h2>Quick Links</h2>
         <ul>
             <li><a href="https://news.ycombinator.com">Hacker News (news.ycombinator.com)</a> — Tech &amp; startup links</li>
             <li><a href="https://lobste.rs">Lobsters (lobste.rs)</a> — Computing-focused community</li>
-            <li><a href="https://en.wikipedia.org/wiki/Rust_(programming_language)">Wikipedia: Rust Programming Language</a></li>
-            <li><a href="https://lite.cnn.com">CNN Lite (lite.cnn.com)</a> — Text-only news feed</li>
-            <li><a href="https://html.duckduckgo.com/html/?q=rust+programming">DuckDuckGo HTML Search</a></li>
+            <li><a href="https://www.reddit.com/r/rust">Reddit /r/rust (auto-rewrites to old.reddit.com)</a></li>
+            <li><a href="https://en.wikipedia.org/wiki/Rust_(programming_language)">Wikipedia: Rust (auto-rewrites to en.m.wikipedia.org)</a></li>
+            <li><a href="https://html.duckduckgo.com/html/">DuckDuckGo HTML Search Home</a></li>
         </ul>
-        <h2>Browser Controls &amp; Modes</h2>
+        <h2>Phase 2 Capabilities &amp; Controls</h2>
         <ul>
-            <li><strong>Address / Search Bar:</strong> Enter any URL or type keywords to search immediately via <code>DuckDuckGo HTML</code>.</li>
-            <li><strong>[ 📖 Reader / Full DOM ]:</strong> Toggle between clean article extraction (<code>&lt;article&gt;</code> / <code>&lt;main&gt;</code>, stripping navigation clutter) and the full document body.</li>
-            <li><strong>[ 🌗 Theme ]:</strong> Cycle between <em>High-Contrast Light</em>, <em>Dark</em>, and <em>Sepia / Paper</em> reading themes.</li>
-            <li><strong>[ ⚡ WebKit Fallback ]:</strong> On-demand escalation trigger for JavaScript-heavy SPA sites (logs target URL in Phase 1).</li>
+            <li><strong>Interactive Native Forms:</strong> Fill in search boxes and submit <code>GET</code> forms directly inside pages like DuckDuckGo HTML and Wikipedia.</li>
+            <li><strong>[ 🔄 Smart Redirects ]:</strong> Automatically rewrites <code>reddit.com</code> to <code>old.reddit.com</code>, <code>en.wikipedia.org</code> to <code>en.m.wikipedia.org</code>, and strips <code>utm_*</code>, <code>fbclid</code>, and <code>gclid</code> tracking params.</li>
+            <li><strong>[ 🛡️ Blocked: X ]:</strong> Powered by <code>adblock-rust</code> and cosmetic DOM filters blocking ad domains, cookie consent modals, and newsletter popups.</li>
+            <li><strong>[ 🖼️ Images: OFF / ON ]:</strong> Defaults to <code>OFF</code> with compact <code>[IMG: alt]</code> badges; toggle <code>ON</code> for lazy image loading.</li>
         </ul>
         <blockquote>"Simplicity is prerequisite for reliability." — Edsger W. Dijkstra</blockquote>
-        <pre><code>Architecture: HTTP (reqwest) -> HTML AST (scraper) -> Semantic DomNode -> Native egui Widgets</code></pre>
+        <pre><code>Architecture: HTTP (reqwest) -> Adblock &amp; Smart Redirects -> HTML AST (scraper) -> Native egui Widgets</code></pre>
     </main>
 </body>
 </html>"#
             .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_smart_redirects_and_utm_stripping() {
+        let reddit = rewrite_url(
+            "https://www.reddit.com/r/rust?utm_source=share&utm_medium=web2x&sort=top",
+            true,
+        );
+        assert_eq!(reddit, "https://old.reddit.com/r/rust?sort=top");
+
+        let wiki = rewrite_url(
+            "https://en.wikipedia.org/wiki/Rust_(programming_language)?fbclid=12345",
+            true,
+        );
+        assert_eq!(
+            wiki,
+            "https://en.m.wikipedia.org/wiki/Rust_(programming_language)"
+        );
+
+        let disabled = rewrite_url("https://www.reddit.com/r/rust?utm_source=test", false);
+        assert_eq!(disabled, "https://www.reddit.com/r/rust?utm_source=test");
     }
 }

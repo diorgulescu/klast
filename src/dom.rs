@@ -1,4 +1,5 @@
-use crate::net::{is_blocked_url, resolve_url};
+use crate::adblock_filter::AdblockFilter;
+use crate::net::resolve_url;
 use scraper::{ElementRef, Html, Node, Selector};
 use url::Url;
 
@@ -9,6 +10,23 @@ pub enum InlineSpan {
     Italic(String),
     Code(String),
     Link { text: String, href: String },
+    ImageBadge { alt: String, url: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormInput {
+    pub name: String,
+    pub initial_value: String,
+    pub placeholder: String,
+    pub is_hidden: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormNode {
+    pub action: String,
+    pub method: String,
+    pub inputs: Vec<FormInput>,
+    pub submit_label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +36,8 @@ pub enum DomNode {
     List(Vec<Vec<InlineSpan>>),
     CodeBlock(String),
     Quote(String),
+    Form(FormNode),
+    Image { url: String, alt: String },
     HorizontalRule,
 }
 
@@ -25,20 +45,45 @@ pub enum DomNode {
 pub struct ParsedDocument {
     pub title: String,
     pub nodes: Vec<DomNode>,
+    pub blocked_count: usize,
 }
 
-/// Parses raw HTML into a clean flat-block sequence of semantic `DomNode` items.
-pub fn parse_html(raw_html: &str, base_url_str: &str, reader_mode: bool) -> ParsedDocument {
+struct ParseContext<'a> {
+    base_url: Option<Url>,
+    source_url: &'a str,
+    reader_mode: bool,
+    images_enabled: bool,
+    adblock: &'a AdblockFilter,
+    blocked_count: usize,
+}
+
+/// Parses raw HTML into a clean flat-block sequence of semantic `DomNode` items,
+/// applying adblock URL & cosmetic rules, form extraction, and lazy image handling.
+pub fn parse_html(
+    raw_html: &str,
+    base_url_str: &str,
+    reader_mode: bool,
+    images_enabled: bool,
+    adblock: &AdblockFilter,
+) -> ParsedDocument {
     let document = Html::parse_document(raw_html);
     let base_url = Url::parse(base_url_str).ok();
 
     let title = extract_title(&document).unwrap_or_else(|| base_url_str.to_string());
     let mut nodes = Vec::new();
+    let mut ctx = ParseContext {
+        base_url,
+        source_url: base_url_str,
+        reader_mode,
+        images_enabled,
+        adblock,
+        blocked_count: 0,
+    };
 
     if reader_mode {
         if let Some(roots) = find_reader_roots(&document) {
             for root in roots {
-                walk_block_container(root, base_url.as_ref(), reader_mode, &mut nodes);
+                walk_block_container(root, &mut ctx, &mut nodes);
             }
         }
     }
@@ -47,19 +92,18 @@ pub fn parse_html(raw_html: &str, base_url_str: &str, reader_mode: bool) -> Pars
     if nodes.is_empty() {
         if let Ok(body_sel) = Selector::parse("body") {
             if let Some(body) = document.select(&body_sel).next() {
-                walk_block_container(body, base_url.as_ref(), reader_mode, &mut nodes);
+                walk_block_container(body, &mut ctx, &mut nodes);
             } else {
-                walk_block_container(
-                    document.root_element(),
-                    base_url.as_ref(),
-                    reader_mode,
-                    &mut nodes,
-                );
+                walk_block_container(document.root_element(), &mut ctx, &mut nodes);
             }
         }
     }
 
-    ParsedDocument { title, nodes }
+    ParsedDocument {
+        title,
+        nodes,
+        blocked_count: ctx.blocked_count,
+    }
 }
 
 fn extract_title(document: &Html) -> Option<String> {
@@ -86,13 +130,29 @@ fn find_reader_roots(document: &Html) -> Option<Vec<ElementRef<'_>>> {
     None
 }
 
-fn should_strip_element(tag: &str, reader_mode: bool) -> bool {
+fn should_strip_tag(tag: &str, reader_mode: bool) -> bool {
     match tag {
         "script" | "style" | "svg" | "noscript" | "iframe" | "head" | "meta" | "link"
         | "canvas" | "audio" | "video" | "picture" | "source" | "object" | "embed" => true,
         "nav" | "footer" | "aside" => reader_mode,
         _ => false,
     }
+}
+
+fn check_and_skip_element(el: ElementRef<'_>, ctx: &mut ParseContext<'_>) -> bool {
+    let tag = el.value().name();
+    if should_strip_tag(tag, ctx.reader_mode) {
+        return true;
+    }
+
+    let id = el.value().attr("id");
+    let class = el.value().attr("class");
+    if ctx.adblock.should_block_element(tag, id, class) {
+        ctx.blocked_count += 1;
+        return true;
+    }
+
+    false
 }
 
 fn is_block_tag(tag: &str) -> bool {
@@ -143,7 +203,7 @@ fn has_nested_block_elements(el: ElementRef<'_>, reader_mode: bool) -> bool {
     for child in el.children() {
         if let Node::Element(child_el) = child.value() {
             let tag = child_el.name();
-            if should_strip_element(tag, reader_mode) {
+            if should_strip_tag(tag, reader_mode) {
                 continue;
             }
             if is_block_tag(tag) {
@@ -161,8 +221,7 @@ fn has_nested_block_elements(el: ElementRef<'_>, reader_mode: bool) -> bool {
 
 fn walk_block_container(
     container: ElementRef<'_>,
-    base_url: Option<&Url>,
-    reader_mode: bool,
+    ctx: &mut ParseContext<'_>,
     out: &mut Vec<DomNode>,
 ) {
     let mut inline_buf: Vec<InlineSpan> = Vec::new();
@@ -173,25 +232,32 @@ fn walk_block_container(
                 push_clean_text(&mut inline_buf, &text.text);
             }
             Node::Element(el_data) => {
-                let tag = el_data.name();
-                if should_strip_element(tag, reader_mode) {
-                    continue;
-                }
-
                 let Some(child_el) = ElementRef::wrap(child) else {
                     continue;
                 };
+                if check_and_skip_element(child_el, ctx) {
+                    continue;
+                }
 
+                let tag = el_data.name();
                 if tag == "br" {
                     flush_paragraph(&mut inline_buf, out);
                     continue;
                 }
 
+                if tag == "img" && ctx.images_enabled {
+                    flush_paragraph(&mut inline_buf, out);
+                    if let Some(img_node) = parse_image_node(child_el, ctx) {
+                        out.push(img_node);
+                    }
+                    continue;
+                }
+
                 if is_block_tag(tag) {
                     flush_paragraph(&mut inline_buf, out);
-                    process_block_element(child_el, base_url, reader_mode, out);
+                    process_block_element(child_el, ctx, out);
                 } else {
-                    collect_inline_spans(child_el, base_url, reader_mode, &mut inline_buf);
+                    collect_inline_spans(child_el, ctx, &mut inline_buf, out);
                 }
             }
             _ => {}
@@ -203,19 +269,18 @@ fn walk_block_container(
 
 fn process_block_element(
     el: ElementRef<'_>,
-    base_url: Option<&Url>,
-    reader_mode: bool,
+    ctx: &mut ParseContext<'_>,
     out: &mut Vec<DomNode>,
 ) {
-    let tag = el.value().name();
-    if should_strip_element(tag, reader_mode) {
+    if check_and_skip_element(el, ctx) {
         return;
     }
 
+    let tag = el.value().name();
     match tag {
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             let level = tag[1..].parse::<u8>().unwrap_or(1).clamp(1, 6);
-            let text = extract_visible_text(el, reader_mode);
+            let text = extract_visible_text(el, ctx.reader_mode);
             if !text.is_empty() {
                 out.push(DomNode::Heading(level, text));
             }
@@ -233,18 +298,31 @@ fn process_block_element(
             }
         }
         "blockquote" => {
-            let quote_text = extract_visible_text(el, reader_mode);
+            let quote_text = extract_visible_text(el, ctx.reader_mode);
             if !quote_text.is_empty() {
                 out.push(DomNode::Quote(quote_text));
+            }
+        }
+        "form" => {
+            if let Some(form_node) = extract_form_node(el, ctx) {
+                out.push(DomNode::Form(form_node));
+            }
+            // If the form also wraps rich content tables/lists (e.g. legacy forums),
+            // walk any non-input content blocks inside it.
+            if form_contains_content_blocks(el) {
+                walk_block_container(el, ctx, out);
             }
         }
         "ul" | "ol" => {
             let mut items: Vec<Vec<InlineSpan>> = Vec::new();
             for child in el.children() {
                 if let Some(child_el) = ElementRef::wrap(child) {
+                    if check_and_skip_element(child_el, ctx) {
+                        continue;
+                    }
                     if child_el.value().name() == "li" {
                         let mut spans = Vec::new();
-                        collect_inline_spans(child_el, base_url, reader_mode, &mut spans);
+                        collect_inline_spans(child_el, ctx, &mut spans, out);
                         normalize_spans(&mut spans);
                         if !spans.is_empty() {
                             items.push(spans);
@@ -258,19 +336,20 @@ fn process_block_element(
         }
         "p" | "dt" | "dd" | "figcaption" | "summary" => {
             let mut spans = Vec::new();
-            collect_inline_spans(el, base_url, reader_mode, &mut spans);
+            collect_inline_spans(el, ctx, &mut spans, out);
             flush_paragraph(&mut spans, out);
         }
         "tr" => {
-            // If this table row contains only inline content inside its cells (like Hacker News rows),
-            // render the cells together as a single paragraph line.
-            if !row_has_block_containers(el, reader_mode) {
+            if !row_has_block_containers(el, ctx.reader_mode) {
                 let mut row_spans: Vec<InlineSpan> = Vec::new();
                 for cell in el.children().filter_map(ElementRef::wrap) {
+                    if check_and_skip_element(cell, ctx) {
+                        continue;
+                    }
                     let cell_tag = cell.value().name();
                     if cell_tag == "td" || cell_tag == "th" {
                         let mut cell_spans = Vec::new();
-                        collect_inline_spans(cell, base_url, reader_mode, &mut cell_spans);
+                        collect_inline_spans(cell, ctx, &mut cell_spans, out);
                         normalize_spans(&mut cell_spans);
                         if !cell_spans.is_empty() {
                             if !row_spans.is_empty() {
@@ -282,12 +361,183 @@ fn process_block_element(
                 }
                 flush_paragraph(&mut row_spans, out);
             } else {
-                walk_block_container(el, base_url, reader_mode, out);
+                walk_block_container(el, ctx, out);
             }
         }
         _ => {
-            walk_block_container(el, base_url, reader_mode, out);
+            walk_block_container(el, ctx, out);
         }
+    }
+}
+
+fn extract_form_node(form_el: ElementRef<'_>, ctx: &ParseContext<'_>) -> Option<FormNode> {
+    let raw_action = form_el.value().attr("action").unwrap_or("");
+    let action = if raw_action.trim().is_empty() {
+        ctx.source_url.to_string()
+    } else {
+        resolve_url(ctx.base_url.as_ref(), raw_action)
+            .unwrap_or_else(|| ctx.source_url.to_string())
+    };
+
+    let method = form_el
+        .value()
+        .attr("method")
+        .unwrap_or("GET")
+        .trim()
+        .to_ascii_uppercase();
+
+    let mut inputs: Vec<FormInput> = Vec::new();
+    let mut submit_label: Option<String> = None;
+    let mut has_visible_input = false;
+
+    if let Ok(sel) = Selector::parse("input, button") {
+        for control in form_el.select(&sel) {
+            let tag = control.value().name();
+            if tag == "input" {
+                let input_type = control
+                    .value()
+                    .attr("type")
+                    .unwrap_or("text")
+                    .trim()
+                    .to_ascii_lowercase();
+
+                match input_type.as_str() {
+                    "text" | "search" | "url" | "email" | "tel" | "number" => {
+                        let name = control
+                            .value()
+                            .attr("name")
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("q")
+                            .to_string();
+                        let initial_value =
+                            control.value().attr("value").unwrap_or("").to_string();
+                        let placeholder = control
+                            .value()
+                            .attr("placeholder")
+                            .or_else(|| control.value().attr("title"))
+                            .or_else(|| control.value().attr("aria-label"))
+                            .unwrap_or(&name)
+                            .to_string();
+
+                        inputs.push(FormInput {
+                            name,
+                            initial_value,
+                            placeholder: collapse_whitespace(&placeholder),
+                            is_hidden: false,
+                        });
+                        has_visible_input = true;
+                    }
+                    "hidden" => {
+                        if let Some(name) = control
+                            .value()
+                            .attr("name")
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            let initial_value =
+                                control.value().attr("value").unwrap_or("").to_string();
+                            inputs.push(FormInput {
+                                name: name.to_string(),
+                                initial_value,
+                                placeholder: String::new(),
+                                is_hidden: true,
+                            });
+                        }
+                    }
+                    "submit" => {
+                        if submit_label.is_none() {
+                            let val = control
+                                .value()
+                                .attr("value")
+                                .map(collapse_whitespace)
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| "Submit".to_string());
+                            submit_label = Some(val);
+                        }
+                    }
+                    _ => {}
+                }
+            } else if tag == "button" {
+                let btn_type = control
+                    .value()
+                    .attr("type")
+                    .unwrap_or("submit")
+                    .trim()
+                    .to_ascii_lowercase();
+                if btn_type == "submit" && submit_label.is_none() {
+                    let text = extract_visible_text(control, ctx.reader_mode);
+                    let fallback = control
+                        .value()
+                        .attr("value")
+                        .or_else(|| control.value().attr("aria-label"))
+                        .map(collapse_whitespace)
+                        .unwrap_or_default();
+                    let chosen = if !text.is_empty() {
+                        text
+                    } else if !fallback.is_empty() {
+                        fallback
+                    } else {
+                        "Submit".to_string()
+                    };
+                    submit_label = Some(chosen);
+                }
+            }
+        }
+    }
+
+    if !has_visible_input {
+        return None;
+    }
+
+    Some(FormNode {
+        action,
+        method,
+        inputs,
+        submit_label: submit_label.unwrap_or_else(|| "Search / Submit".to_string()),
+    })
+}
+
+fn form_contains_content_blocks(form_el: ElementRef<'_>) -> bool {
+    if let Ok(sel) = Selector::parse("table, article, ul, ol, blockquote, pre") {
+        return form_el.select(&sel).next().is_some();
+    }
+    false
+}
+
+fn parse_image_node(img_el: ElementRef<'_>, ctx: &mut ParseContext<'_>) -> Option<DomNode> {
+    let raw_src = img_el
+        .value()
+        .attr("src")
+        .or_else(|| img_el.value().attr("data-src"))?;
+    let resolved = resolve_url(ctx.base_url.as_ref(), raw_src)?;
+
+    if ctx.adblock.should_block_url(&resolved, ctx.source_url, "image") {
+        ctx.blocked_count += 1;
+        return None;
+    }
+
+    let raw_alt = img_el
+        .value()
+        .attr("alt")
+        .or_else(|| img_el.value().attr("title"))
+        .unwrap_or("image");
+    let alt = {
+        let cleaned = collapse_whitespace(raw_alt);
+        if cleaned.is_empty() {
+            "image".to_string()
+        } else {
+            cleaned
+        }
+    };
+
+    if ctx.images_enabled {
+        Some(DomNode::Image { url: resolved, alt })
+    } else {
+        Some(DomNode::Paragraph(vec![InlineSpan::ImageBadge {
+            alt,
+            url: resolved,
+        }]))
     }
 }
 
@@ -305,52 +555,88 @@ fn row_has_block_containers(tr_el: ElementRef<'_>, reader_mode: bool) -> bool {
 
 fn collect_inline_spans(
     el: ElementRef<'_>,
-    base_url: Option<&Url>,
-    reader_mode: bool,
+    ctx: &mut ParseContext<'_>,
     spans: &mut Vec<InlineSpan>,
+    out: &mut Vec<DomNode>,
 ) {
-    let tag = el.value().name();
-    if should_strip_element(tag, reader_mode) {
+    if check_and_skip_element(el, ctx) {
         return;
     }
 
+    let tag = el.value().name();
     match tag {
         "a" => {
-            let link_text = extract_visible_text(el, reader_mode);
+            let link_text = extract_visible_text(el, ctx.reader_mode);
             if link_text.is_empty() {
+                // Check if the anchor wraps an image
+                if let Ok(img_sel) = Selector::parse("img") {
+                    if let Some(img_el) = el.select(&img_sel).next() {
+                        if let Some(node) = parse_image_node(img_el, ctx) {
+                            match node {
+                                DomNode::Image { url, alt } => {
+                                    out.push(DomNode::Image { url, alt });
+                                }
+                                DomNode::Paragraph(mut badge_spans) => {
+                                    ensure_space_before_inline(spans);
+                                    spans.append(&mut badge_spans);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
                 return;
             }
             if let Some(raw_href) = el.value().attr("href") {
-                if let Some(resolved) = resolve_url(base_url, raw_href) {
+                if let Some(resolved) = resolve_url(ctx.base_url.as_ref(), raw_href) {
                     let final_href = unwrap_search_redirect(&resolved);
-                    if !is_blocked_url(&final_href) {
-                        ensure_space_before_inline(spans);
-                        spans.push(InlineSpan::Link {
-                            text: link_text,
-                            href: final_href,
-                        });
+                    if ctx
+                        .adblock
+                        .should_block_url(&final_href, ctx.source_url, "sub_frame")
+                    {
+                        ctx.blocked_count += 1;
                         return;
                     }
+                    ensure_space_before_inline(spans);
+                    spans.push(InlineSpan::Link {
+                        text: link_text,
+                        href: final_href,
+                    });
+                    return;
                 }
             }
             push_clean_text(spans, &link_text);
         }
+        "img" => {
+            if let Some(node) = parse_image_node(el, ctx) {
+                match node {
+                    DomNode::Image { url, alt } => {
+                        out.push(DomNode::Image { url, alt });
+                    }
+                    DomNode::Paragraph(mut badge_spans) => {
+                        ensure_space_before_inline(spans);
+                        spans.append(&mut badge_spans);
+                    }
+                    _ => {}
+                }
+            }
+        }
         "b" | "strong" => {
-            let text = extract_visible_text(el, reader_mode);
+            let text = extract_visible_text(el, ctx.reader_mode);
             if !text.is_empty() {
                 ensure_space_before_inline(spans);
                 spans.push(InlineSpan::Bold(text));
             }
         }
         "i" | "em" => {
-            let text = extract_visible_text(el, reader_mode);
+            let text = extract_visible_text(el, ctx.reader_mode);
             if !text.is_empty() {
                 ensure_space_before_inline(spans);
                 spans.push(InlineSpan::Italic(text));
             }
         }
         "code" | "kbd" | "samp" => {
-            let text = extract_visible_text(el, reader_mode);
+            let text = extract_visible_text(el, ctx.reader_mode);
             if !text.is_empty() {
                 ensure_space_before_inline(spans);
                 spans.push(InlineSpan::Code(text));
@@ -359,20 +645,8 @@ fn collect_inline_spans(
         "br" => {
             spans.push(InlineSpan::Text("\n".to_string()));
         }
-        "input" => {
-            let input_type = el.value().attr("type").unwrap_or("text");
-            if input_type != "hidden" {
-                let label = el
-                    .value()
-                    .attr("value")
-                    .or_else(|| el.value().attr("placeholder"))
-                    .unwrap_or(input_type);
-                let clean = collapse_whitespace(label);
-                if !clean.is_empty() {
-                    ensure_space_before_inline(spans);
-                    spans.push(InlineSpan::Code(format!("[{clean}]")));
-                }
-            }
+        "input" | "button" => {
+            // Inputs and buttons inside <form> are already rendered as native widgets via DomNode::Form.
         }
         _ => {
             for child in el.children() {
@@ -380,12 +654,9 @@ fn collect_inline_spans(
                     Node::Text(t) => {
                         push_clean_text(spans, &t.text);
                     }
-                    Node::Element(child_data) => {
-                        if should_strip_element(child_data.name(), reader_mode) {
-                            continue;
-                        }
+                    Node::Element(_) => {
                         if let Some(child_el) = ElementRef::wrap(child) {
-                            collect_inline_spans(child_el, base_url, reader_mode, spans);
+                            collect_inline_spans(child_el, ctx, spans, out);
                         }
                     }
                     _ => {}
@@ -423,7 +694,7 @@ fn collect_raw_visible_text(el: ElementRef<'_>, reader_mode: bool, buf: &mut Str
                 buf.push(' ');
             }
             Node::Element(child_data) => {
-                if should_strip_element(child_data.name(), reader_mode) {
+                if should_strip_tag(child_data.name(), reader_mode) {
                     continue;
                 }
                 if let Some(child_el) = ElementRef::wrap(child) {
@@ -539,13 +810,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_reader_mode_strips_nav_and_keeps_article() {
+    fn test_reader_mode_and_cosmetic_blocking() {
         let html = r#"
         <html>
             <body>
+                <div id="cookie-consent-popup">Accept all cookies</div>
                 <nav><a href="/home">Nav Link</a></nav>
                 <article>
                     <h1>Article Title</h1>
+                    <div class="newsletter-promo">Subscribe to our newsletter!</div>
                     <p>Hello <b>world</b> and <a href="/docs">Docs</a>.</p>
                 </article>
                 <footer>Footer text</footer>
@@ -553,7 +826,9 @@ mod tests {
         </html>
         "#;
 
-        let reader_doc = parse_html(html, "https://example.com/blog/post", true);
+        let adblock = AdblockFilter::new();
+        let reader_doc = parse_html(html, "https://example.com/blog/post", true, false, &adblock);
+        assert_eq!(reader_doc.blocked_count, 1); // newsletter-promo inside article blocked
         assert_eq!(
             reader_doc.nodes,
             vec![
@@ -571,7 +846,42 @@ mod tests {
             ]
         );
 
-        let full_doc = parse_html(html, "https://example.com/blog/post", false);
-        assert_eq!(full_doc.nodes.len(), 4);
+        let full_doc = parse_html(html, "https://example.com/blog/post", false, false, &adblock);
+        assert_eq!(full_doc.blocked_count, 2); // cookie-consent-popup + newsletter-promo blocked
+    }
+
+    #[test]
+    fn test_form_and_lazy_image_parsing() {
+        let html = r#"
+        <html>
+            <body>
+                <form action="/search" method="get">
+                    <input type="search" name="q" value="rust" placeholder="Search..." />
+                    <button type="submit">Go</button>
+                </form>
+                <p>Diagram: <img src="/img/arch.png" alt="Architecture Diagram" /></p>
+            </body>
+        </html>
+        "#;
+
+        let adblock = AdblockFilter::new();
+        let doc_images_off = parse_html(html, "https://example.com", false, false, &adblock);
+        assert!(doc_images_off.nodes.iter().any(|n| matches!(
+            n,
+            DomNode::Form(f) if f.action == "https://example.com/search" && f.inputs.len() == 1 && f.inputs[0].name == "q"
+        )));
+        assert!(doc_images_off.nodes.iter().any(|n| matches!(
+            n,
+            DomNode::Paragraph(spans) if spans.contains(&InlineSpan::ImageBadge {
+                alt: "Architecture Diagram".to_string(),
+                url: "https://example.com/img/arch.png".to_string(),
+            })
+        )));
+
+        let doc_images_on = parse_html(html, "https://example.com", false, true, &adblock);
+        assert!(doc_images_on.nodes.iter().any(|n| matches!(
+            n,
+            DomNode::Image { url, alt } if url == "https://example.com/img/arch.png" && alt == "Architecture Diagram"
+        )));
     }
 }

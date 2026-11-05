@@ -1,9 +1,11 @@
-use crate::dom::{parse_html, DomNode, InlineSpan};
-use crate::net::{FetchResult, NetworkClient};
+use crate::adblock_filter::AdblockFilter;
+use crate::dom::{parse_html, DomNode, FormNode, InlineSpan};
+use crate::net::{build_get_form_url, rewrite_url, FetchResult, NetworkClient};
 use eframe::egui::{
-    self, Color32, FontFamily, FontId, Frame, Key, Margin, RichText, Rounding, ScrollArea, Sense,
-    Stroke, TextEdit, Vec2, Visuals,
+    self, Color32, ColorImage, FontFamily, FontId, Frame, Key, Margin, RichText, Rounding,
+    ScrollArea, Sense, Stroke, TextEdit, TextureHandle, TextureOptions, Vec2, Visuals,
 };
+use std::collections::{HashMap, HashSet};
 
 const DEFAULT_HOME_URL: &str = "https://news.ycombinator.com";
 
@@ -83,6 +85,12 @@ pub struct ThemePalette {
     pub is_dark: bool,
 }
 
+enum ImageState {
+    Loading,
+    Loaded(TextureHandle, Vec2),
+    Failed(String),
+}
+
 pub struct KlastApp {
     address_input: String,
     current_url: String,
@@ -91,11 +99,26 @@ pub struct KlastApp {
     dom_nodes: Vec<DomNode>,
     bytes_received: usize,
 
+    // Form state keyed by input `name`
+    form_inputs: HashMap<String, String>,
+
+    // Navigation history stack
     history: Vec<String>,
     history_index: Option<usize>,
 
+    // Browser mode toggles
     reader_mode: bool,
+    smart_redirects: bool,
+    images_enabled: bool,
     theme: BrowserTheme,
+
+    // Adblock engine and live counter
+    adblock: AdblockFilter,
+    blocked_count: usize,
+
+    // Lazy image cache and on-demand preview set
+    image_cache: HashMap<String, ImageState>,
+    previewed_images: HashSet<String>,
 
     is_loading: bool,
     status_message: String,
@@ -116,10 +139,17 @@ impl KlastApp {
             raw_html: String::new(),
             dom_nodes: Vec::new(),
             bytes_received: 0,
+            form_inputs: HashMap::new(),
             history: Vec::new(),
             history_index: None,
             reader_mode: false,
+            smart_redirects: true,
+            images_enabled: false,
             theme,
+            adblock: AdblockFilter::new(),
+            blocked_count: 0,
+            image_cache: HashMap::new(),
+            previewed_images: HashSet::new(),
             is_loading: false,
             status_message: "Ready".to_string(),
             hovered_link: None,
@@ -179,7 +209,10 @@ impl KlastApp {
     }
 
     fn navigate_to(&mut self, raw_input: String, record_history: bool) {
-        let resolved_url = self.net_client.fetch(&raw_input);
+        self.form_inputs.clear();
+        self.previewed_images.clear();
+
+        let resolved_url = self.net_client.fetch(&raw_input, self.smart_redirects);
         self.current_url = resolved_url.clone();
         self.address_input = resolved_url.clone();
         self.is_loading = true;
@@ -238,16 +271,54 @@ impl KlastApp {
         if self.raw_html.is_empty() {
             return;
         }
-        let parsed = parse_html(&self.raw_html, &self.current_url, self.reader_mode);
+        let parsed = parse_html(
+            &self.raw_html,
+            &self.current_url,
+            self.reader_mode,
+            self.images_enabled,
+            &self.adblock,
+        );
         self.page_title = parsed.title;
+        self.blocked_count = parsed.blocked_count;
         self.dom_nodes = parsed.nodes;
+
+        // Seed form_inputs map with initial values for any form fields not yet edited
+        for node in &self.dom_nodes {
+            if let DomNode::Form(form) = node {
+                for input in &form.inputs {
+                    self.form_inputs
+                        .entry(input.name.clone())
+                        .or_insert_with(|| input.initial_value.clone());
+                }
+            }
+        }
+    }
+
+    fn submit_form(&mut self, form: &FormNode) {
+        let field_pairs: Vec<(String, String)> = form
+            .inputs
+            .iter()
+            .map(|inp| (inp.name.clone(), inp.name.clone()))
+            .collect();
+
+        // Construct GET URL with query parameters using the `url` crate
+        if let Some(target_url) = build_get_form_url(&form.action, &field_pairs, &self.form_inputs) {
+            self.navigate_to(target_url, true);
+        }
+    }
+
+    fn ensure_image_requested(&mut self, url: &str) {
+        if !self.image_cache.contains_key(url) {
+            self.image_cache.insert(url.to_string(), ImageState::Loading);
+            self.net_client.fetch_image(url);
+        }
     }
 
     fn poll_network(&mut self, ctx: &egui::Context) {
         while let Some(result) = self.net_client.poll() {
-            self.is_loading = false;
             match result {
                 FetchResult::Success(resp) => {
+                    self.is_loading = false;
                     self.current_url = resp.final_url.clone();
                     self.address_input = resp.final_url;
                     self.bytes_received = resp.bytes_received;
@@ -260,6 +331,7 @@ impl KlastApp {
                     )));
                 }
                 FetchResult::Error { url, error } => {
+                    self.is_loading = false;
                     self.status_message = format!("Error loading {url}");
                     self.bytes_received = 0;
                     self.dom_nodes = vec![
@@ -280,10 +352,30 @@ impl KlastApp {
                         ]),
                     ];
                 }
+                FetchResult::ImageLoaded {
+                    url,
+                    rgba,
+                    width,
+                    height,
+                } => {
+                    let color_image = ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+                    let texture =
+                        ctx.load_texture(&url, color_image, TextureOptions::LINEAR);
+                    let display_size = Vec2::new(width as f32, height as f32);
+                    self.image_cache
+                        .insert(url, ImageState::Loaded(texture, display_size));
+                }
+                FetchResult::ImageFailed { url, error } => {
+                    self.image_cache.insert(url, ImageState::Failed(error));
+                }
             }
         }
 
-        if self.is_loading {
+        let any_image_loading = self
+            .image_cache
+            .values()
+            .any(|s| matches!(s, ImageState::Loading));
+        if self.is_loading || any_image_loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
@@ -292,14 +384,14 @@ impl KlastApp {
         let p = self.theme.palette();
         let frame = Frame::none()
             .fill(p.panel_bg)
-            .inner_margin(Margin::symmetric(8.0, 4.0))
+            .inner_margin(Margin::symmetric(6.0, 4.0))
             .stroke(Stroke::new(1.0_f32, p.border));
 
         egui::TopBottomPanel::top("klast_top_toolbar")
             .exact_height(32.0)
             .frame(frame)
             .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
                 ui.horizontal_centered(|ui| {
                     // Navigation buttons
                     if ui
@@ -326,12 +418,12 @@ impl KlastApp {
                         self.reload();
                     }
 
-                    // Mode Toggles aligned to the right so the address bar fills remaining width
+                    // Mode Toggles & Status Badges aligned right so address bar fills remaining width
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .button("[ ⚡ WebKit Fallback ]")
                             .on_hover_text(
-                                "Escalate current URL to system WebView (Phase 1 logs URL to stdout)",
+                                "Escalate current URL to system WebView (Phase 1/2 logs URL to stdout)",
                             )
                             .clicked()
                         {
@@ -352,8 +444,45 @@ impl KlastApp {
                             Self::apply_flat_visuals(ctx, self.theme);
                         }
 
+                        let img_label = if self.images_enabled {
+                            "[ 🖼️ Images: ON ]"
+                        } else {
+                            "[ 🖼️ Images: OFF ]"
+                        };
+                        if ui
+                            .button(img_label)
+                            .on_hover_text(
+                                "Toggle lazy image loading (OFF renders lightweight [IMG: alt] badges)",
+                            )
+                            .clicked()
+                        {
+                            self.images_enabled = !self.images_enabled;
+                            self.reparse_current_html();
+                        }
+
+                        let redirect_label = if self.smart_redirects {
+                            "[ 🔄 Smart Redirects: ON ]"
+                        } else {
+                            "[ 🔄 Smart Redirects: OFF ]"
+                        };
+                        if ui
+                            .button(redirect_label)
+                            .on_hover_text(
+                                "Rewrite reddit.com -> old.reddit.com, en.wikipedia.org -> en.m.wikipedia.org, and strip tracking params",
+                            )
+                            .clicked()
+                        {
+                            self.smart_redirects = !self.smart_redirects;
+                            if self.smart_redirects {
+                                let rewritten = rewrite_url(&self.current_url, true);
+                                if rewritten != self.current_url {
+                                    self.navigate_to(rewritten, true);
+                                }
+                            }
+                        }
+
                         let mode_label = if self.reader_mode {
-                            "[ 📖 Reader Mode ]"
+                            "[ 📖 Reader ]"
                         } else {
                             "[ 📖 Full DOM ]"
                         };
@@ -368,8 +497,15 @@ impl KlastApp {
                             self.reparse_current_html();
                         }
 
+                        // Live adblock counter badge
+                        let blocked_badge = format!("[ 🛡️ Blocked: {} ]", self.blocked_count);
+                        ui.add_enabled(false, egui::Button::new(blocked_badge))
+                            .on_disabled_hover_text(
+                                "Number of ad/tracker URLs and cosmetic banner/consent elements stripped on this page",
+                            );
+
                         // Single-line Address / Search Bar taking up all remaining width
-                        let available_width = ui.available_width().max(120.0);
+                        let available_width = ui.available_width().max(100.0);
                         let response = ui.add_sized(
                             [available_width, 22.0],
                             TextEdit::singleline(&mut self.address_input)
@@ -406,8 +542,9 @@ impl KlastApp {
 
                     let kb = self.bytes_received as f32 / 1024.0;
                     let summary = format!(
-                        "{status_str}  |  DOM Nodes: {}  |  Payload: {:.1} KB (JS/Ads Off)",
+                        "{status_str}  |  DOM Nodes: {}  |  Blocked: {}  |  Payload: {:.1} KB",
                         self.dom_nodes.len(),
+                        self.blocked_count,
                         kb
                     );
                     ui.label(
@@ -432,11 +569,16 @@ impl KlastApp {
     fn render_document_view(&mut self, ctx: &egui::Context) {
         let p = self.theme.palette();
         let mut clicked_link: Option<String> = None;
+        let mut submitted_form: Option<FormNode> = None;
+        let mut requested_images: Vec<String> = Vec::new();
+        let mut newly_previewed: Vec<(String, String)> = Vec::new();
         self.hovered_link = None;
 
         let central_frame = Frame::none()
             .fill(p.bg)
             .inner_margin(Margin::symmetric(24.0, 16.0));
+
+        let dom_snapshot = self.dom_nodes.clone();
 
         egui::CentralPanel::default()
             .frame(central_frame)
@@ -448,14 +590,14 @@ impl KlastApp {
                         ui.set_max_width(ui.available_width().min(max_read_width));
                         ui.spacing_mut().item_spacing = Vec2::new(4.0, 10.0);
 
-                        if self.dom_nodes.is_empty() && !self.is_loading {
+                        if dom_snapshot.is_empty() && !self.is_loading {
                             ui.label(
                                 RichText::new("No text content extracted from this page.")
                                     .color(p.muted_fg),
                             );
                         }
 
-                        for node in &self.dom_nodes {
+                        for (node_idx, node) in dom_snapshot.iter().enumerate() {
                             match node {
                                 DomNode::Heading(level, text) => {
                                     let size = match level {
@@ -481,7 +623,17 @@ impl KlastApp {
                                         p,
                                         &mut self.hovered_link,
                                         &mut clicked_link,
+                                        &mut newly_previewed,
                                     );
+                                    // Render any inline-previewed images triggered from badges in this paragraph
+                                    for span in spans {
+                                        if let InlineSpan::ImageBadge { alt, url } = span {
+                                            if self.previewed_images.contains(url) {
+                                                requested_images.push(url.clone());
+                                                self.render_image_widget(ui, url, alt, p, &mut clicked_link);
+                                            }
+                                        }
+                                    }
                                 }
                                 DomNode::List(items) => {
                                     for item_spans in items {
@@ -501,6 +653,7 @@ impl KlastApp {
                                                 p,
                                                 &mut self.hovered_link,
                                                 &mut clicked_link,
+                                                &mut newly_previewed,
                                             );
                                         });
                                     }
@@ -532,6 +685,65 @@ impl KlastApp {
                                         );
                                     });
                                 }
+                                DomNode::Form(form) => {
+                                    Frame::none()
+                                        .fill(p.code_bg)
+                                        .stroke(Stroke::new(1.0_f32, p.border))
+                                        .inner_margin(Margin::symmetric(10.0, 8.0))
+                                        .show(ui, |ui| {
+                                            ui.push_id(format!("form_{node_idx}"), |ui| {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.spacing_mut().item_spacing =
+                                                        Vec2::new(8.0, 6.0);
+                                                    for (input_idx, input) in
+                                                        form.inputs.iter().enumerate()
+                                                    {
+                                                        if input.is_hidden {
+                                                            continue;
+                                                        }
+                                                        let val = self
+                                                            .form_inputs
+                                                            .entry(input.name.clone())
+                                                            .or_insert_with(|| {
+                                                                input.initial_value.clone()
+                                                            });
+
+                                                        let resp = ui.add_sized(
+                                                            [280.0, 22.0],
+                                                            TextEdit::singleline(val)
+                                                                .id_source(format!(
+                                                                    "input_{node_idx}_{input_idx}_{}",
+                                                                    input.name
+                                                                ))
+                                                                .font(FontId::new(
+                                                                    13.5,
+                                                                    FontFamily::Monospace,
+                                                                ))
+                                                                .hint_text(&input.placeholder),
+                                                        );
+
+                                                        if resp.lost_focus()
+                                                            && ui.input(|i| {
+                                                                i.key_pressed(Key::Enter)
+                                                            })
+                                                        {
+                                                            submitted_form = Some(form.clone());
+                                                        }
+                                                    }
+
+                                                    let btn_text =
+                                                        format!("[ {} ]", form.submit_label);
+                                                    if ui.button(btn_text).clicked() {
+                                                        submitted_form = Some(form.clone());
+                                                    }
+                                                });
+                                            });
+                                        });
+                                }
+                                DomNode::Image { url, alt } => {
+                                    requested_images.push(url.clone());
+                                    self.render_image_widget(ui, url, alt, p, &mut clicked_link);
+                                }
                                 DomNode::HorizontalRule => {
                                     ui.separator();
                                 }
@@ -542,9 +754,74 @@ impl KlastApp {
                     });
             });
 
-        if let Some(target_href) = clicked_link {
+        for (alt, url) in newly_previewed {
+            self.previewed_images.insert(url.clone());
+            requested_images.push(url.clone());
+            self.status_message = format!("Previewing image: {alt}");
+        }
+
+        for img_url in requested_images {
+            self.ensure_image_requested(&img_url);
+        }
+
+        if let Some(form) = submitted_form {
+            self.submit_form(&form);
+        } else if let Some(target_href) = clicked_link {
             self.navigate_to(target_href, true);
         }
+    }
+
+    fn render_image_widget(
+        &self,
+        ui: &mut egui::Ui,
+        url: &str,
+        alt: &str,
+        p: ThemePalette,
+        clicked_link: &mut Option<String>,
+    ) {
+        Frame::none()
+            .fill(p.code_bg)
+            .stroke(Stroke::new(1.0_f32, p.border))
+            .inner_margin(Margin::symmetric(8.0, 6.0))
+            .show(ui, |ui| {
+                match self.image_cache.get(url) {
+                    Some(ImageState::Loaded(texture, size)) => {
+                        let max_w = ui.available_width().min(560.0);
+                        let scale = if size.x > max_w && size.x > 0.0 {
+                            max_w / size.x
+                        } else {
+                            1.0
+                        };
+                        let render_size = Vec2::new(size.x * scale, size.y * scale);
+                        ui.image((texture.id(), render_size));
+                        ui.label(
+                            RichText::new(format!("🖼️ {alt}"))
+                                .font(FontId::new(12.0, FontFamily::Monospace))
+                                .color(p.muted_fg),
+                        );
+                    }
+                    Some(ImageState::Failed(err)) => {
+                        let resp = ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("[IMG: {alt} — {err} (click to open URL)]"))
+                                    .font(FontId::new(12.5, FontFamily::Monospace))
+                                    .color(p.muted_fg),
+                            )
+                            .sense(Sense::click()),
+                        );
+                        if resp.clicked() {
+                            *clicked_link = Some(url.to_string());
+                        }
+                    }
+                    _ => {
+                        ui.label(
+                            RichText::new(format!("⏳ Loading image: {alt}..."))
+                                .font(FontId::new(12.5, FontFamily::Monospace))
+                                .color(p.muted_fg),
+                        );
+                    }
+                }
+            });
     }
 
     fn render_inline_spans(
@@ -553,6 +830,7 @@ impl KlastApp {
         p: ThemePalette,
         hovered_link: &mut Option<String>,
         clicked_link: &mut Option<String>,
+        newly_previewed: &mut Vec<(String, String)>,
     ) {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(0.0, 4.0);
@@ -601,6 +879,23 @@ impl KlastApp {
                         }
                         if resp.clicked() {
                             *clicked_link = Some(href.clone());
+                        }
+                    }
+                    InlineSpan::ImageBadge { alt, url } => {
+                        let badge_text = format!("[IMG: {alt}]");
+                        let badge_rich = RichText::new(badge_text)
+                            .font(FontId::new(12.5, FontFamily::Monospace))
+                            .background_color(p.code_bg)
+                            .color(p.accent);
+                        let resp = ui
+                            .add(egui::Label::new(badge_rich).sense(Sense::click()))
+                            .on_hover_text(format!("Click to preview image ({url})"));
+                        if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            *hovered_link = Some(url.clone());
+                        }
+                        if resp.clicked() {
+                            newly_previewed.push((alt.clone(), url.clone()));
                         }
                     }
                 }
