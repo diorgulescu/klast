@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Klast Contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
 use crate::adblock_filter::AdblockFilter;
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -28,9 +36,20 @@ pub struct FetchResponse {
 #[derive(Debug, Clone)]
 pub enum FetchResult {
     Success(FetchResponse),
-    Error { url: String, error: String },
-    ImageLoaded { url: String, rgba: Vec<u8>, width: usize, height: usize },
-    ImageFailed { url: String, error: String },
+    Error {
+        url: String,
+        error: String,
+    },
+    ImageLoaded {
+        url: String,
+        rgba: Vec<u8>,
+        width: usize,
+        height: usize,
+    },
+    ImageFailed {
+        url: String,
+        error: String,
+    },
 }
 
 pub struct NetworkClient {
@@ -160,7 +179,7 @@ pub fn build_get_form_url(
 }
 
 /// Converts raw address bar input into either an internal `about:` URL,
-/// a normalized `http(s)://` URL, or a DuckDuckGo HTML search query URL.
+/// a local `file://` URL, a normalized `http(s)://` URL, or a DuckDuckGo HTML search query URL.
 pub fn normalize_input_to_url(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -357,7 +376,23 @@ fn perform_image_request(image_url: &str) -> FetchResult {
 
 pub fn build_internal_page(about_url: &str) -> String {
     match about_url {
-        "about:welcome" | _ => r#"<!DOCTYPE html>
+        "about:license" => r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Klast License — GNU GPL v3</title>
+</head>
+<body>
+    <main>
+        <h1>GNU General Public License v3.0</h1>
+        <p><strong>Klast</strong> is free software: you can redistribute it and/or modify it under the terms of the <strong>GNU General Public License</strong> as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.</p>
+        <p>This program is distributed in the hope that it will be useful, but <strong>WITHOUT ANY WARRANTY</strong>; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.</p>
+        <hr />
+        <p>Return to <a href="about:welcome">about:welcome</a> or view <a href="https://www.gnu.org/licenses/gpl-3.0.html">full GPLv3 license on gnu.org</a>.</p>
+    </main>
+</body>
+</html>"#
+            .to_string(),
+        _ => r#"<!DOCTYPE html>
 <html>
 <head>
     <title>Welcome to Klast Browser</title>
@@ -365,7 +400,7 @@ pub fn build_internal_page(about_url: &str) -> String {
 <body>
     <main>
         <h1>Klast — Ultra-Lightweight Hybrid Web Browser</h1>
-        <p>Welcome to <strong>Klast</strong>, a fast, non-bloated, text-first web browser built in Rust for low-resource systems and distraction-free reading.</p>
+        <p>Welcome to <strong>Klast</strong>, a fast, non-bloated, text-first web browser built in Rust for low-resource systems and distraction-free reading. Released under <a href="about:license">GNU GPL v3</a>.</p>
         <form action="https://html.duckduckgo.com/html/" method="get">
             <input type="search" name="q" placeholder="Search the web via DuckDuckGo HTML..." value="" />
             <button type="submit">Search Web</button>
@@ -377,14 +412,15 @@ pub fn build_internal_page(about_url: &str) -> String {
             <li><a href="https://lobste.rs">Lobsters (lobste.rs)</a> — Computing-focused community</li>
             <li><a href="https://www.reddit.com/r/rust">Reddit /r/rust (auto-rewrites to old.reddit.com)</a></li>
             <li><a href="https://en.wikipedia.org/wiki/Rust_(programming_language)">Wikipedia: Rust (auto-rewrites to en.m.wikipedia.org)</a></li>
-            <li><a href="https://html.duckduckgo.com/html/">DuckDuckGo HTML Search Home</a></li>
+            <li><a href="about:bookmarks">Bookmarks &amp; Offline Reading List (about:bookmarks)</a></li>
         </ul>
-        <h2>Phase 2 Capabilities &amp; Controls</h2>
+        <h2>Browser Capabilities &amp; Controls</h2>
         <ul>
             <li><strong>Interactive Native Forms:</strong> Fill in search boxes and submit <code>GET</code> forms directly inside pages like DuckDuckGo HTML and Wikipedia.</li>
             <li><strong>[ 🔄 Smart Redirects ]:</strong> Automatically rewrites <code>reddit.com</code> to <code>old.reddit.com</code>, <code>en.wikipedia.org</code> to <code>en.m.wikipedia.org</code>, and strips <code>utm_*</code>, <code>fbclid</code>, and <code>gclid</code> tracking params.</li>
             <li><strong>[ 🛡️ Blocked: X ]:</strong> Powered by <code>adblock-rust</code> and cosmetic DOM filters blocking ad domains, cookie consent modals, and newsletter popups.</li>
             <li><strong>[ 🖼️ Images: OFF / ON ]:</strong> Defaults to <code>OFF</code> with compact <code>[IMG: alt]</code> badges; toggle <code>ON</code> for lazy image loading.</li>
+            <li><strong>[ ★ Bookmarks ] / [ 📥 Save Offline ]:</strong> Plain-text Markdown bookmarks and offline article archiving in <code>~/.config/klast/</code>.</li>
         </ul>
         <blockquote>"Simplicity is prerequisite for reliability." — Edsger W. Dijkstra</blockquote>
         <pre><code>Architecture: HTTP (reqwest) -> Adblock &amp; Smart Redirects -> HTML AST (scraper) -> Native egui Widgets</code></pre>
@@ -418,5 +454,39 @@ mod tests {
 
         let disabled = rewrite_url("https://www.reddit.com/r/rust?utm_source=test", false);
         assert_eq!(disabled, "https://www.reddit.com/r/rust?utm_source=test");
+    }
+
+    #[test]
+    fn test_normalize_input_and_resolve_url() {
+        assert_eq!(normalize_input_to_url(""), "about:welcome");
+        assert_eq!(normalize_input_to_url("about:bookmarks"), "about:bookmarks");
+        assert_eq!(
+            normalize_input_to_url("file:///tmp/article.md"),
+            "file:///tmp/article.md"
+        );
+        assert_eq!(normalize_input_to_url("lobste.rs"), "https://lobste.rs");
+        assert_eq!(
+            normalize_input_to_url("rust web browser"),
+            "https://html.duckduckgo.com/html/?q=rust+web+browser"
+        );
+
+        let base = Url::parse("https://news.ycombinator.com/news").ok();
+        assert_eq!(
+            resolve_url(base.as_ref(), "item?id=123"),
+            Some("https://news.ycombinator.com/item?id=123".to_string())
+        );
+        assert_eq!(resolve_url(base.as_ref(), "javascript:void(0)"), None);
+    }
+
+    #[test]
+    fn test_build_get_form_url() {
+        let mut values = HashMap::new();
+        values.insert("q".to_string(), "openbsd rust".to_string());
+        let fields = vec![("q".to_string(), "q".to_string())];
+        let built = build_get_form_url("https://html.duckduckgo.com/html/", &fields, &values);
+        assert_eq!(
+            built,
+            Some("https://html.duckduckgo.com/html/?q=openbsd+rust".to_string())
+        );
     }
 }

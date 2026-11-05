@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Klast Contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
 use crate::dom::{DomNode, InlineSpan};
 use std::env;
 use std::fs;
@@ -128,7 +136,8 @@ impl StorageManager {
         if !bookmarks_md.contains(&link_needle) {
             let clean_title = sanitize_markdown_label(title, url);
             let kb = (bytes_written as f32 / 1024.0).max(0.1);
-            let offline_entry = format!("- [{clean_title}]({file_url}) — Saved offline ({kb:.1} KB)\n");
+            let offline_entry =
+                format!("- [{clean_title}]({file_url}) — Saved offline ({kb:.1} KB)\n");
 
             if !bookmarks_md.contains("## Offline Reading List") {
                 if !bookmarks_md.ends_with('\n') {
@@ -150,7 +159,11 @@ impl StorageManager {
 /// Converts a slice of `DomNode` into a clean, human-readable Markdown document.
 pub fn dom_to_markdown(title: &str, url: &str, nodes: &[DomNode]) -> String {
     let mut out = String::new();
-    let display_title = if title.trim().is_empty() { url } else { title.trim() };
+    let display_title = if title.trim().is_empty() {
+        url
+    } else {
+        title.trim()
+    };
 
     out.push_str(&format!("# {display_title}\n\n"));
     out.push_str(&format!("> Source: [{url}]({url})\n\n---\n\n"));
@@ -297,5 +310,44 @@ mod tests {
         assert!(parsed.contains(&DomNode::Heading(2, "Section Header".to_string())));
         assert!(parsed.contains(&DomNode::Quote("Less is more.".to_string())));
         assert!(parsed.contains(&DomNode::CodeBlock("fn main() {}".to_string())));
+    }
+
+    #[test]
+    fn test_storage_manager_bookmarks_and_offline_archive() {
+        let temp_dir = std::env::temp_dir().join(format!("klast_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let manager = StorageManager::with_base_dir(temp_dir.clone());
+        let initial_md = manager.read_bookmarks_markdown().unwrap();
+        assert!(initial_md.contains("# ★ Bookmarks"));
+        assert!(initial_md.contains("## Offline Reading List"));
+
+        let added = manager
+            .add_bookmark("FreeBSD Project", "https://www.freebsd.org")
+            .unwrap();
+        assert!(added);
+
+        let duplicate = manager
+            .add_bookmark("FreeBSD Duplicate", "https://www.freebsd.org")
+            .unwrap();
+        assert!(!duplicate);
+
+        let nodes = vec![
+            DomNode::Heading(2, "Offline Content".to_string()),
+            DomNode::Paragraph(vec![InlineSpan::Text(
+                "Saved for offline reading.".to_string(),
+            )]),
+        ];
+        let (saved_path, bytes) = manager
+            .save_offline_article("FreeBSD Handbook", "https://docs.freebsd.org", &nodes)
+            .unwrap();
+        assert!(saved_path.exists());
+        assert!(bytes > 0);
+
+        let updated_md = manager.read_bookmarks_markdown().unwrap();
+        assert!(updated_md.contains("FreeBSD Project"));
+        assert!(updated_md.contains("FreeBSD Handbook"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

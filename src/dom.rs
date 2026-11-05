@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Klast Contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
 use crate::adblock_filter::AdblockFilter;
 use crate::net::resolve_url;
 use scraper::{ElementRef, Html, Node, Selector};
@@ -267,11 +275,7 @@ fn walk_block_container(
     flush_paragraph(&mut inline_buf, out);
 }
 
-fn process_block_element(
-    el: ElementRef<'_>,
-    ctx: &mut ParseContext<'_>,
-    out: &mut Vec<DomNode>,
-) {
+fn process_block_element(el: ElementRef<'_>, ctx: &mut ParseContext<'_>, out: &mut Vec<DomNode>) {
     if check_and_skip_element(el, ctx) {
         return;
     }
@@ -339,30 +343,26 @@ fn process_block_element(
             collect_inline_spans(el, ctx, &mut spans, out);
             flush_paragraph(&mut spans, out);
         }
-        "tr" => {
-            if !row_has_block_containers(el, ctx.reader_mode) {
-                let mut row_spans: Vec<InlineSpan> = Vec::new();
-                for cell in el.children().filter_map(ElementRef::wrap) {
-                    if check_and_skip_element(cell, ctx) {
-                        continue;
-                    }
-                    let cell_tag = cell.value().name();
-                    if cell_tag == "td" || cell_tag == "th" {
-                        let mut cell_spans = Vec::new();
-                        collect_inline_spans(cell, ctx, &mut cell_spans, out);
-                        normalize_spans(&mut cell_spans);
-                        if !cell_spans.is_empty() {
-                            if !row_spans.is_empty() {
-                                row_spans.push(InlineSpan::Text(" ".to_string()));
-                            }
-                            row_spans.extend(cell_spans);
+        "tr" if !row_has_block_containers(el, ctx.reader_mode) => {
+            let mut row_spans: Vec<InlineSpan> = Vec::new();
+            for cell in el.children().filter_map(ElementRef::wrap) {
+                if check_and_skip_element(cell, ctx) {
+                    continue;
+                }
+                let cell_tag = cell.value().name();
+                if cell_tag == "td" || cell_tag == "th" {
+                    let mut cell_spans = Vec::new();
+                    collect_inline_spans(cell, ctx, &mut cell_spans, out);
+                    normalize_spans(&mut cell_spans);
+                    if !cell_spans.is_empty() {
+                        if !row_spans.is_empty() {
+                            row_spans.push(InlineSpan::Text(" ".to_string()));
                         }
+                        row_spans.extend(cell_spans);
                     }
                 }
-                flush_paragraph(&mut row_spans, out);
-            } else {
-                walk_block_container(el, ctx, out);
             }
+            flush_paragraph(&mut row_spans, out);
         }
         _ => {
             walk_block_container(el, ctx, out);
@@ -375,8 +375,7 @@ fn extract_form_node(form_el: ElementRef<'_>, ctx: &ParseContext<'_>) -> Option<
     let action = if raw_action.trim().is_empty() {
         ctx.source_url.to_string()
     } else {
-        resolve_url(ctx.base_url.as_ref(), raw_action)
-            .unwrap_or_else(|| ctx.source_url.to_string())
+        resolve_url(ctx.base_url.as_ref(), raw_action).unwrap_or_else(|| ctx.source_url.to_string())
     };
 
     let method = form_el
@@ -410,8 +409,7 @@ fn extract_form_node(form_el: ElementRef<'_>, ctx: &ParseContext<'_>) -> Option<
                             .filter(|s| !s.is_empty())
                             .unwrap_or("q")
                             .to_string();
-                        let initial_value =
-                            control.value().attr("value").unwrap_or("").to_string();
+                        let initial_value = control.value().attr("value").unwrap_or("").to_string();
                         let placeholder = control
                             .value()
                             .attr("placeholder")
@@ -445,16 +443,14 @@ fn extract_form_node(form_el: ElementRef<'_>, ctx: &ParseContext<'_>) -> Option<
                             });
                         }
                     }
-                    "submit" => {
-                        if submit_label.is_none() {
-                            let val = control
-                                .value()
-                                .attr("value")
-                                .map(collapse_whitespace)
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or_else(|| "Submit".to_string());
-                            submit_label = Some(val);
-                        }
+                    "submit" if submit_label.is_none() => {
+                        let val = control
+                            .value()
+                            .attr("value")
+                            .map(collapse_whitespace)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "Submit".to_string());
+                        submit_label = Some(val);
                     }
                     _ => {}
                 }
@@ -512,7 +508,10 @@ fn parse_image_node(img_el: ElementRef<'_>, ctx: &mut ParseContext<'_>) -> Optio
         .or_else(|| img_el.value().attr("data-src"))?;
     let resolved = resolve_url(ctx.base_url.as_ref(), raw_src)?;
 
-    if ctx.adblock.should_block_url(&resolved, ctx.source_url, "image") {
+    if ctx
+        .adblock
+        .should_block_url(&resolved, ctx.source_url, "image")
+    {
         ctx.blocked_count += 1;
         return None;
     }
@@ -544,10 +543,8 @@ fn parse_image_node(img_el: ElementRef<'_>, ctx: &mut ParseContext<'_>) -> Optio
 fn row_has_block_containers(tr_el: ElementRef<'_>, reader_mode: bool) -> bool {
     for cell in tr_el.children().filter_map(ElementRef::wrap) {
         let cell_tag = cell.value().name();
-        if cell_tag == "td" || cell_tag == "th" {
-            if has_nested_block_elements(cell, reader_mode) {
-                return true;
-            }
+        if (cell_tag == "td" || cell_tag == "th") && has_nested_block_elements(cell, reader_mode) {
+            return true;
         }
     }
     false
@@ -921,7 +918,9 @@ pub fn parse_markdown_to_dom(md: &str) -> Vec<DomNode> {
     }
 
     if in_code_block && !code_buf.is_empty() {
-        nodes.push(DomNode::CodeBlock(code_buf.trim_end_matches('\n').to_string()));
+        nodes.push(DomNode::CodeBlock(
+            code_buf.trim_end_matches('\n').to_string(),
+        ));
     }
     flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
 
@@ -1114,7 +1113,13 @@ mod tests {
             ]
         );
 
-        let full_doc = parse_html(html, "https://example.com/blog/post", false, false, &adblock);
+        let full_doc = parse_html(
+            html,
+            "https://example.com/blog/post",
+            false,
+            false,
+            &adblock,
+        );
         assert_eq!(full_doc.blocked_count, 2); // cookie-consent-popup + newsletter-promo blocked
     }
 

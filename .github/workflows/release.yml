@@ -1,0 +1,337 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Release Pipeline — Multi-OS & Low-Spec Hardware
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ============================================================================
+  # 1. Linux Packages (.deb, .rpm, .tar.gz) — glibc, musl, x86, ARM, RISC-V, PPC
+  # ============================================================================
+  linux-deb-rpm:
+    name: Linux .deb & .rpm (x86_64 glibc + musl)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies and packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            musl-tools \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libssl-dev \
+            libx11-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libfontconfig1-dev \
+            rpm
+          cargo install cargo-deb cargo-generate-rpm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
+
+      - name: Build native x86_64-unknown-linux-gnu release
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Build .deb package (glibc)
+        run: |
+          mkdir -p dist
+          cargo deb --target x86_64-unknown-linux-gnu --no-build -o dist/klast_amd64.deb
+
+      - name: Build .rpm package (glibc)
+        run: |
+          cp target/x86_64-unknown-linux-gnu/release/klast target/release-bin-tmp || true
+          mkdir -p target/release
+          cp target/x86_64-unknown-linux-gnu/release/klast target/release/klast
+          cargo generate-rpm
+          cp target/generate-rpm/*.rpm dist/
+
+      - name: Build portable x86_64-unknown-linux-musl release & .deb
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl --no-default-features
+          cargo deb --target x86_64-unknown-linux-musl --no-build -- -o dist/klast_amd64_musl.deb || true
+
+      - name: Upload .deb and .rpm artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb-rpm-packages
+          path: dist/*
+
+  linux-multiarch:
+    name: Linux Multi-Arch & Low-Spec (.tar.gz — ${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Standard & 32-bit Low-Spec x86 (Pentium-M, Atom, Geode, Old ThinkPads)
+          - target: x86_64-unknown-linux-gnu
+            features: ""
+          - target: x86_64-unknown-linux-musl
+            features: "--no-default-features"
+          - target: i686-unknown-linux-gnu
+            features: "--no-default-features"
+          - target: i686-unknown-linux-musl
+            features: "--no-default-features"
+          # ARM64, ARMv7hf, and ARMv5te (Raspberry Pi, Pinebook, BeagleBone, SBCs)
+          - target: aarch64-unknown-linux-gnu
+            features: "--no-default-features"
+          - target: aarch64-unknown-linux-musl
+            features: "--no-default-features"
+          - target: armv7-unknown-linux-gnueabihf
+            features: "--no-default-features"
+          - target: armv7-unknown-linux-musleabihf
+            features: "--no-default-features"
+          - target: armv5te-unknown-linux-gnueabi
+            features: "--no-default-features"
+          # RISC-V 64-bit (VisionFive 2, Milk-V, LicheePi) & PowerPC64LE
+          - target: riscv64gc-unknown-linux-gnu
+            features: "--no-default-features"
+          - target: riscv64gc-unknown-linux-musl
+            features: "--no-default-features"
+          - target: powerpc64le-unknown-linux-gnu
+            features: "--no-default-features"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross-rs for multi-arch compilation
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Install host webkit2gtk for native x86_64 build
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - name: Build release binary for ${{ matrix.target }}
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            rustup target add x86_64-unknown-linux-gnu
+            cargo build --release --target x86_64-unknown-linux-gnu
+          else
+            cross build --release --target ${{ matrix.target }} ${{ matrix.features }}
+          fi
+
+      - name: Package .tar.gz archive
+        run: |
+          mkdir -p dist/klast-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/klast dist/klast-${{ matrix.target }}/
+          cp LICENSE README.md dist/klast-${{ matrix.target }}/
+          cp packaging/klast.desktop dist/klast-${{ matrix.target }}/
+          tar -C dist -czvf dist/klast-${{ matrix.target }}.tar.gz klast-${{ matrix.target }}
+
+      - name: Upload Linux tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.target }}
+          path: dist/klast-${{ matrix.target }}.tar.gz
+
+  # ============================================================================
+  # 2. macOS Release (Intel x86_64 macOS 10.12+ & Apple Silicon aarch64)
+  # ============================================================================
+  macos-release:
+    name: macOS Release (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            deployment_target: "10.12"
+          - target: aarch64-apple-darwin
+            deployment_target: "11.0"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build macOS release binary
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package macOS .tar.gz archive
+        run: |
+          mkdir -p dist/klast-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/klast dist/klast-${{ matrix.target }}/
+          cp LICENSE README.md dist/klast-${{ matrix.target }}/
+          tar -C dist -czvf dist/klast-${{ matrix.target }}.tar.gz klast-${{ matrix.target }}
+
+      - name: Upload macOS tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}
+          path: dist/klast-${{ matrix.target }}.tar.gz
+
+  # ============================================================================
+  # 3. FreeBSD, NetBSD, and OpenBSD Releases
+  # ============================================================================
+  bsd-release:
+    name: BSD Release (${{ matrix.os }} / ${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: freebsd
+            version: "14.1"
+            arch: x86_64
+          - os: freebsd
+            version: "14.1"
+            arch: arm64
+          - os: netbsd
+            version: "10.0"
+            arch: x86_64
+          - os: openbsd
+            version: "7.5"
+            arch: x86_64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build and package inside ${{ matrix.os }} VM
+        uses: cross-platform-actions/action@v0.25.0
+        with:
+          operating_system: ${{ matrix.os }}
+          version: ${{ matrix.version }}
+          architecture: ${{ matrix.arch }}
+          memory: 4G
+          cpu_count: 2
+          run: |
+            if [ "${{ matrix.os }}" = "freebsd" ]; then
+              sudo pkg install -y rust pkgconf libX11 libXcursor libXrandr libXi mesa-libs fontconfig
+            elif [ "${{ matrix.os }}" = "netbsd" ]; then
+              export PATH="/usr/pkg/bin:/usr/pkg/sbin:$PATH"
+              sudo pkgin -y install rust pkgconf modular-xorg-libs MesaLib fontconfig
+            elif [ "${{ matrix.os }}" = "openbsd" ]; then
+              sudo pkg_add rust
+            fi
+            cargo build --release --no-default-features
+            mkdir -p dist/klast-${{ matrix.os }}-${{ matrix.arch }}
+            cp target/release/klast dist/klast-${{ matrix.os }}-${{ matrix.arch }}/
+            cp LICENSE README.md packaging/klast.desktop dist/klast-${{ matrix.os }}-${{ matrix.arch }}/
+            tar -C dist -czvf dist/klast-${{ matrix.os }}-${{ matrix.arch }}.tar.gz klast-${{ matrix.os }}-${{ matrix.arch }}
+
+      - name: Upload BSD tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: bsd-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/klast-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+
+  # ============================================================================
+  # 4. Windows Releases (Modern 10/11 + Legacy Windows XP SP3 / Windows 7+)
+  # ============================================================================
+  windows-release:
+    name: Windows Release (${{ matrix.label }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Modern Windows 10/11 (includes WebView2 fallback)
+          - target: x86_64-pc-windows-msvc
+            features: ""
+            label: "win10-11-x64-msvc"
+            legacy_pe: false
+          - target: i686-pc-windows-msvc
+            features: ""
+            label: "win10-11-x86-msvc"
+            legacy_pe: false
+          # Legacy Windows 7 / Vista / XP SP3 (32-bit & 64-bit MinGW-w64 MSVCRT, no WebView2 dependency, PE subsystem 5.01/6.01)
+          - target: i686-pc-windows-gnu
+            features: "--no-default-features"
+            label: "winxp-win7-legacy-x86-gnu"
+            legacy_pe: true
+          - target: x86_64-pc-windows-gnu
+            features: "--no-default-features"
+            label: "win7-legacy-x64-gnu"
+            legacy_pe: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build Windows binary (${{ matrix.label }})
+        shell: bash
+        run: |
+          if [ "${{ matrix.legacy_pe }}" = "true" ]; then
+            # Set PE Subsystem to 5.01 (Windows XP SP3+ / Windows 7+) and avoid WebView2 requirement
+            export CFLAGS="-D_WIN32_WINNT=0x0501 -DWINVER=0x0501"
+            export RUSTFLAGS="-C link-arg=-Wl,--major-subsystem-version,5 -C link-arg=-Wl,--minor-subsystem-version,1 -C target-feature=+crt-static"
+          fi
+          cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
+
+      - name: Package Windows .zip archive
+        shell: bash
+        run: |
+          mkdir -p dist/klast-${{ matrix.label }}
+          cp target/${{ matrix.target }}/release/klast.exe dist/klast-${{ matrix.label }}/
+          cp LICENSE README.md dist/klast-${{ matrix.label }}/
+          7z a -tzip dist/klast-${{ matrix.label }}.zip ./dist/klast-${{ matrix.label }}/*
+
+      - name: Upload Windows .zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.label }}
+          path: dist/klast-${{ matrix.label }}.zip
+
+  # ============================================================================
+  # 5. Aggregate Artifacts & Publish GitHub Release
+  # ============================================================================
+  publish-release:
+    name: Publish GitHub Release
+    needs: [linux-deb-rpm, linux-multiarch, macos-release, bsd-release, windows-release]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true

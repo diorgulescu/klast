@@ -1,11 +1,10 @@
-use crate::adblock_filter::AdblockFilter;
-use tao::{
-    dpi::LogicalSize,
-    event::{Event, WindowEvent},
-    event_loop::{ControlFlow, EventLoopBuilder},
-    window::WindowBuilder,
-};
-use wry::WebViewBuilder;
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Klast Contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
 
 pub const LOW_SPEC_INIT_SCRIPT: &str = r#"
 (function() {
@@ -94,52 +93,140 @@ pub const LOW_SPEC_INIT_SCRIPT: &str = r#"
 })();
 "#;
 
-#[derive(Debug, Clone, Copy)]
-enum FallbackEvent {
-    CloseRequested,
+#[cfg(all(
+    feature = "system-webview",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+mod native_webview {
+    use super::LOW_SPEC_INIT_SCRIPT;
+    use crate::adblock_filter::AdblockFilter;
+    use tao::{
+        dpi::LogicalSize,
+        event::{Event, WindowEvent},
+        event_loop::{ControlFlow, EventLoopBuilder},
+        window::WindowBuilder,
+    };
+    use wry::WebViewBuilder;
+
+    #[derive(Debug, Clone, Copy)]
+    enum FallbackEvent {
+        CloseRequested,
+    }
+
+    pub fn run_webview_impl(target_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let event_loop = EventLoopBuilder::<FallbackEvent>::with_user_event().build();
+        let proxy = event_loop.create_proxy();
+
+        let window = WindowBuilder::new()
+            .with_title(format!("Klast [WebKit Fallback Mode] - {target_url}"))
+            .with_inner_size(LogicalSize::new(1080.0, 740.0))
+            .build(&event_loop)?;
+
+        let adblock = AdblockFilter::new();
+        let source_url = target_url.to_string();
+
+        let _webview = WebViewBuilder::new()
+            .with_url(target_url)
+            .with_initialization_script(LOW_SPEC_INIT_SCRIPT)
+            .with_ipc_handler(move |req| {
+                if req.body() == "close_webview" {
+                    let _ = proxy.send_event(FallbackEvent::CloseRequested);
+                }
+            })
+            .with_navigation_handler(move |nav_url: String| {
+                let blocked = adblock.should_block_url(&nav_url, &source_url, "document");
+                !blocked
+            })
+            .build(&window)?;
+
+        event_loop.run(move |event, _, control_flow| {
+            *control_flow = ControlFlow::Wait;
+
+            match event {
+                Event::UserEvent(FallbackEvent::CloseRequested) => {
+                    *control_flow = ControlFlow::Exit;
+                }
+                Event::WindowEvent {
+                    event: WindowEvent::CloseRequested,
+                    ..
+                } => {
+                    *control_flow = ControlFlow::Exit;
+                }
+                _ => {}
+            }
+        });
+    }
 }
 
 /// Runs the isolated system WebView fallback process for a single target URL.
+/// On platforms/targets built without `system-webview` (such as FreeBSD, NetBSD, OpenBSD,
+/// static musl Linux, RISC-V, ARMv5/v7, or legacy Windows XP/7), gracefully delegates
+/// to the system's external browser launcher.
 pub fn run_webview(target_url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let event_loop = EventLoopBuilder::<FallbackEvent>::with_user_event().build();
-    let proxy = event_loop.create_proxy();
+    #[cfg(all(
+        feature = "system-webview",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    {
+        native_webview::run_webview_impl(target_url)
+    }
 
-    let window = WindowBuilder::new()
-        .with_title(format!("Klast [WebKit Fallback Mode] - {target_url}"))
-        .with_inner_size(LogicalSize::new(1080.0, 740.0))
-        .build(&event_loop)?;
+    #[cfg(not(all(
+        feature = "system-webview",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )))]
+    {
+        let _ = LOW_SPEC_INIT_SCRIPT;
+        launch_external_browser_fallback(target_url)
+    }
+}
 
-    let adblock = AdblockFilter::new();
-    let source_url = target_url.to_string();
+#[cfg(not(all(
+    feature = "system-webview",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+)))]
+fn launch_external_browser_fallback(target_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
 
-    let _webview = WebViewBuilder::new()
-        .with_url(target_url)
-        .with_initialization_script(LOW_SPEC_INIT_SCRIPT)
-        .with_ipc_handler(move |req| {
-            if req.body() == "close_webview" {
-                let _ = proxy.send_event(FallbackEvent::CloseRequested);
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .args(["/C", "start", "", target_url])
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(target_url).spawn()?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        for candidate in [
+            "xdg-open", "dillo", "netsurf", "falkon", "firefox", "chromium",
+        ] {
+            if Command::new(candidate).arg(target_url).spawn().is_ok() {
+                return Ok(());
             }
-        })
-        .with_navigation_handler(move |nav_url: String| {
-            let blocked = adblock.should_block_url(&nav_url, &source_url, "document");
-            !blocked
-        })
-        .build(&window)?;
-
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
-
-        match event {
-            Event::UserEvent(FallbackEvent::CloseRequested) => {
-                *control_flow = ControlFlow::Exit;
-            }
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => {
-                *control_flow = ControlFlow::Exit;
-            }
-            _ => {}
         }
-    });
+        Err(format!(
+            "System WebView is not compiled in this build target; could not launch external browser for {target_url}"
+        )
+        .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_low_spec_init_script_contains_optimizations() {
+        assert!(LOW_SPEC_INIT_SCRIPT.contains("animation-duration: 0.01ms !important"));
+        assert!(LOW_SPEC_INIT_SCRIPT.contains("transition-duration: 0.01ms !important"));
+        assert!(LOW_SPEC_INIT_SCRIPT.contains("klast-return-btn"));
+        assert!(LOW_SPEC_INIT_SCRIPT.contains("close_webview"));
+    }
 }

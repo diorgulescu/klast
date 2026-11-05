@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Klast Contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
 use adblock::engine::Engine;
 use adblock::lists::{FilterSet, ParseOptions};
 use adblock::request::Request;
@@ -98,7 +106,10 @@ impl AdblockFilter {
     /// Checks whether an HTML container (`div`, `section`, `aside`, etc.) should be skipped
     /// based on its `id` or `class` matching common ad, banner, or cookie-consent patterns.
     pub fn should_block_element(&self, tag: &str, id: Option<&str>, class: Option<&str>) -> bool {
-        if !matches!(tag, "div" | "section" | "aside" | "header" | "footer" | "dialog") {
+        if !matches!(
+            tag,
+            "div" | "section" | "aside" | "header" | "footer" | "dialog"
+        ) {
             return false;
         }
 
@@ -137,6 +148,11 @@ mod tests {
             "https://example.com",
             "script"
         ));
+        assert!(filter.should_block_url(
+            "https://cdn.example.com/fonts/inter.woff2?v=4",
+            "https://example.com",
+            "font"
+        ));
         assert!(!filter.should_block_url(
             "https://news.ycombinator.com/news",
             "https://news.ycombinator.com",
@@ -146,6 +162,8 @@ mod tests {
         assert!(filter.should_block_element("div", Some("cookie-consent-banner"), None));
         assert!(filter.should_block_element("section", None, Some("sidebar promo-box")));
         assert!(filter.should_block_element("aside", None, Some("newsletter-widget")));
+        assert!(filter.should_block_element("div", Some("gdpr_modal"), None));
         assert!(!filter.should_block_element("div", Some("main-content"), Some("article-body")));
+        assert!(!filter.should_block_element("p", Some("cookie-mention"), None));
     }
 }

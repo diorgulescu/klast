@@ -1,8 +1,20 @@
 [package]
 name = "klast"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "An ultra-lightweight, text-first hybrid web browser for low-resource systems"
+license = "GPL-3.0-or-later"
+description = "An ultra-lightweight, text-first hybrid web browser in Rust for older hardware and low-resource systems"
+readme = "README.md"
+repository = "https://github.com/klast-browser/klast"
+homepage = "https://github.com/klast-browser/klast"
+keywords = ["browser", "lightweight", "egui", "markdown", "privacy"]
+categories = ["gui", "web-programming::http-client"]
+
+[features]
+default = ["system-webview"]
+# Enables the isolated wry + tao system WebView fallback on supported desktop OSes.
+# Disable with `--no-default-features` for static musl, BSDs, RISC-V, ARMv5/v7, and legacy Windows XP/7 builds.
+system-webview = ["dep:wry", "dep:tao"]
 
 [dependencies]
 eframe = "0.29"
@@ -11,5 +23,40 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 url = "2.5"
 adblock = { version = "0.13", default-features = false, features = ["embedded-domain-resolver"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
-wry = "0.47"
-tao = "0.30"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+wry = { version = "0.47", optional = true }
+tao = { version = "0.30", optional = true }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[package.metadata.deb]
+maintainer = "Klast Contributors"
+copyright = "2026, Klast Contributors (GPL-3.0-or-later)"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Klast is an ultra-lightweight, non-bloated, text-first hybrid web browser \
+designed for older hardware and low-resource systems. It renders clean semantic \
+HTML and Markdown directly into native GUI widgets with built-in adblocking, \
+smart privacy redirects, and optional subprocess-isolated WebView fallback."""
+depends = "$auto"
+section = "web"
+priority = "optional"
+assets = [
+    ["target/release/klast", "usr/bin/", "755"],
+    ["packaging/klast.desktop", "usr/share/applications/", "644"],
+    ["README.md", "usr/share/doc/klast/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/klast", dest = "/usr/bin/klast", mode = "755" },
+    { source = "packaging/klast.desktop", dest = "/usr/share/applications/klast.desktop", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/klast/LICENSE", doc = true, mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/klast/README.md", doc = true, mode = "644" },
+]

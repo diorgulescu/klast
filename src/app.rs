@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Klast Contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
 use crate::adblock_filter::AdblockFilter;
 use crate::dom::{parse_html, parse_markdown_to_dom, DomNode, FormNode, InlineSpan};
 use crate::net::{
@@ -309,7 +317,8 @@ impl KlastApp {
                     } else {
                         self.reparse_current_html();
                     }
-                    self.status_message = format!("Offline article loaded ({})", file_path.display());
+                    self.status_message =
+                        format!("Offline article loaded ({})", file_path.display());
                 }
                 Err(err) => {
                     self.bytes_received = 0;
@@ -498,7 +507,8 @@ impl KlastApp {
 
     fn ensure_image_requested(&mut self, url: &str) {
         if !self.image_cache.contains_key(url) {
-            self.image_cache.insert(url.to_string(), ImageState::Loading);
+            self.image_cache
+                .insert(url.to_string(), ImageState::Loading);
             self.net_client.fetch_image(url);
         }
     }

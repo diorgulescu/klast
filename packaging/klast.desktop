@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Klast Browser
+GenericName=Lightweight Web Browser
+Comment=Ultra-lightweight, text-first hybrid web browser for low-resource systems
+Exec=klast %u
+Terminal=false
+Type=Application
+Categories=Network;WebBrowser;
+MimeType=text/html;text/markdown;x-scheme-handler/http;x-scheme-handler/https;
+Keywords=browser;web;text;reader;lightweight;retro;
+StartupNotify=true
