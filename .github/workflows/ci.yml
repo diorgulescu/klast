@@ -79,10 +79,36 @@ jobs:
           - aarch64-unknown-linux-musl
           - armv7-unknown-linux-musleabihf
           - riscv64gc-unknown-linux-gnu
+          - powerpc64le-unknown-linux-gnu
+
+    env:
+      CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
+      AR_x86_64_unknown_linux_musl: x86_64-linux-musl-ar
+      CC_i686_unknown_linux_musl: i686-linux-gnu-gcc
+      AR_i686_unknown_linux_musl: i686-linux-gnu-ar
+      CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+      AR_aarch64_unknown_linux_musl: aarch64-linux-gnu-ar
+      CC_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-gcc
+      AR_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-ar
+      CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc
+      AR_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-ar
+      CC_powerpc64le_unknown_linux_gnu: powerpc64le-linux-gnu-gcc
+      AR_powerpc64le_unknown_linux_gnu: powerpc64le-linux-gnu-ar
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install C cross-compilers for ring and musl targets
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            musl-tools \
+            gcc-i686-linux-gnu \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabihf \
+            gcc-riscv64-linux-gnu \
+            gcc-powerpc64le-linux-gnu
 
       - name: Install Rust toolchain & target
         uses: dtolnay/rust-toolchain@stable

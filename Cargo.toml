@@ -5,8 +5,8 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 description = "An ultra-lightweight, text-first hybrid web browser in Rust for older hardware and low-resource systems"
 readme = "README.md"
-repository = "https://github.com/klast-browser/klast"
-homepage = "https://github.com/klast-browser/klast"
+repository = "https://github.com/diorgulescu/klast"
+homepage = "https://github.com/diorgulescu/klast"
 keywords = ["browser", "lightweight", "egui", "markdown", "privacy"]
 categories = ["gui", "web-programming::http-client"]
 
