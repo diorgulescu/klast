@@ -33,6 +33,9 @@ const CORE_FILTER_RULES: &[&str] = &[
     "||segment.io^",
     "||sentry.io^",
     "||newrelic.com^",
+    "||fonts.googleapis.com^",
+    "||fonts.gstatic.com^",
+    "*.woff2^",
     "##.ad-container",
     "##.advertisement",
     "##.cookie-banner",
@@ -71,6 +74,12 @@ impl AdblockFilter {
 
     /// Checks whether a network or link URL should be blocked given the page's source URL.
     pub fn should_block_url(&self, target_url: &str, source_url: &str, request_type: &str) -> bool {
+        let lower_target = target_url.to_ascii_lowercase();
+        let path_part = lower_target.split('?').next().unwrap_or(&lower_target);
+        if path_part.ends_with(".woff2") {
+            return true;
+        }
+
         let effective_source =
             if source_url.starts_with("http://") || source_url.starts_with("https://") {
                 source_url

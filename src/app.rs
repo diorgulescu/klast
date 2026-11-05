@@ -267,6 +267,30 @@ impl KlastApp {
         self.navigate_to(url, false);
     }
 
+    fn spawn_webkit_fallback(&mut self) {
+        match std::env::current_exe() {
+            Ok(exe_path) => {
+                match std::process::Command::new(exe_path)
+                    .arg("--webview")
+                    .arg(&self.current_url)
+                    .spawn()
+                {
+                    Ok(_) => {
+                        self.status_message =
+                            "Opened in WebKit Fallback process (RAM isolated)".to_string();
+                    }
+                    Err(err) => {
+                        self.status_message =
+                            format!("Failed to spawn WebKit Fallback process: {err}");
+                    }
+                }
+            }
+            Err(err) => {
+                self.status_message = format!("Failed to locate Klast executable: {err}");
+            }
+        }
+    }
+
     fn reparse_current_html(&mut self) {
         if self.raw_html.is_empty() {
             return;
@@ -423,13 +447,11 @@ impl KlastApp {
                         if ui
                             .button("[ ⚡ WebKit Fallback ]")
                             .on_hover_text(
-                                "Escalate current URL to system WebView (Phase 1/2 logs URL to stdout)",
+                                "Launch current URL in an isolated system WebView subprocess",
                             )
                             .clicked()
                         {
-                            println!("{}", self.current_url);
-                            self.status_message =
-                                format!("WebKit fallback requested for {}", self.current_url);
+                            self.spawn_webkit_fallback();
                         }
 
                         let theme_label = format!("[ 🌗 Theme: {} ]", self.theme.label());
