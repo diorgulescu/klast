@@ -247,44 +247,52 @@ jobs:
       matrix:
         include:
           - os: freebsd
-            version: "14.1"
-            arch: x86_64
+            version: "14.2"
+            arch: x86-64
           - os: freebsd
-            version: "14.1"
+            version: "14.2"
             arch: arm64
           - os: netbsd
-            version: "10.0"
-            arch: x86_64
+            version: "10.1"
+            arch: x86-64
           - os: openbsd
-            version: "7.5"
-            arch: x86_64
+            version: "8.0"
+            arch: x86-64
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build and package inside ${{ matrix.os }} VM
-        uses: cross-platform-actions/action@v0.25.0
+      - name: Start ${{ matrix.os }} VM
+        uses: cross-platform-actions/action@v1.7.0
         with:
           operating_system: ${{ matrix.os }}
           version: ${{ matrix.version }}
           architecture: ${{ matrix.arch }}
           memory: 4G
           cpu_count: 2
-          run: |
-            if [ "${{ matrix.os }}" = "freebsd" ]; then
-              sudo pkg install -y rust pkgconf libX11 libXcursor libXrandr libXi mesa-libs fontconfig
-            elif [ "${{ matrix.os }}" = "netbsd" ]; then
-              export PATH="/usr/pkg/bin:/usr/pkg/sbin:$PATH"
-              sudo pkgin -y install rust pkgconf modular-xorg-libs MesaLib fontconfig
-            elif [ "${{ matrix.os }}" = "openbsd" ]; then
-              sudo pkg_add rust
-            fi
-            cargo build --release --no-default-features
-            mkdir -p dist/klast-${{ matrix.os }}-${{ matrix.arch }}
-            cp target/release/klast dist/klast-${{ matrix.os }}-${{ matrix.arch }}/
-            cp LICENSE README.md packaging/klast.desktop dist/klast-${{ matrix.os }}-${{ matrix.arch }}/
-            tar -C dist -czvf dist/klast-${{ matrix.os }}-${{ matrix.arch }}.tar.gz klast-${{ matrix.os }}-${{ matrix.arch }}
+
+      - name: Build and package inside ${{ matrix.os }} VM
+        shell: cpa.sh {0}
+        run: |
+          if [ "${{ matrix.os }}" = "freebsd" ]; then
+            sudo pkg install -y rust pkgconf libX11 libXcursor libXrandr libXi mesa-libs fontconfig
+          elif [ "${{ matrix.os }}" = "netbsd" ]; then
+            export PATH="/usr/pkg/bin:/usr/pkg/sbin:$PATH"
+            export PKG_CONFIG_PATH="/usr/pkg/lib/pkgconfig:/usr/X11R7/lib/pkgconfig"
+            export LIBRARY_PATH="/usr/pkg/lib:/usr/X11R7/lib"
+            export LD_LIBRARY_PATH="/usr/pkg/lib:/usr/X11R7/lib"
+            sudo pkgin -y install rust pkgconf MesaLib fontconfig
+          elif [ "${{ matrix.os }}" = "openbsd" ]; then
+            export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/X11R6/lib/pkgconfig"
+            export LIBRARY_PATH="/usr/local/lib:/usr/X11R6/lib"
+            sudo pkg_add rust
+          fi
+          cargo build --release --no-default-features
+          mkdir -p dist/klast-${{ matrix.os }}-${{ matrix.arch }}
+          cp target/release/klast dist/klast-${{ matrix.os }}-${{ matrix.arch }}/
+          cp LICENSE README.md packaging/klast.desktop dist/klast-${{ matrix.os }}-${{ matrix.arch }}/
+          tar -C dist -czvf dist/klast-${{ matrix.os }}-${{ matrix.arch }}.tar.gz klast-${{ matrix.os }}-${{ matrix.arch }}
 
       - name: Upload BSD tarball
         uses: actions/upload-artifact@v4
@@ -324,6 +332,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install 32-bit/64-bit MinGW-w64 toolchain for GNU targets
+        if: matrix.legacy_pe == true
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "i686-pc-windows-gnu" ]; then
+            C:/msys64/usr/bin/pacman.exe -S --noconfirm --needed mingw-w64-i686-gcc mingw-w64-i686-binutils
+            echo "C:/msys64/mingw32/bin" >> $GITHUB_PATH
+          else
+            echo "C:/msys64/mingw64/bin" >> $GITHUB_PATH
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
