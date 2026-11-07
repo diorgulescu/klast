@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag name (e.g. v0.4.0). Leave empty to auto-detect from Cargo.toml"
+        description: "Optional explicit tag name (e.g. v0.5.0). Leave empty to auto-resolve & auto-increment revision."
         required: false
         default: ""
 
@@ -20,10 +20,75 @@ env:
 
 jobs:
   # ============================================================================
+  # 0. Resolve Release Version & Auto-Increment Patch Revision (0.5.0 -> 0.5.1 -> 0.5.2)
+  # ============================================================================
+  prepare-version:
+    name: Resolve & Auto-Increment Release Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.semver.outputs.version }}
+      tag_name: ${{ steps.semver.outputs.tag_name }}
+      next_version: ${{ steps.semver.outputs.next_version }}
+    steps:
+      - name: Checkout repository with tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute release version and next revision
+        id: semver
+        run: |
+          git fetch --tags --force
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+            VER="${TAG#v}"
+          elif [ -n "${{ inputs.tag_name }}" ]; then
+            RAW="${{ inputs.tag_name }}"
+            VER="${RAW#v}"
+            TAG="v${VER}"
+          else
+            BASE_VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+            MAJOR=$(echo "$BASE_VER" | cut -d. -f1)
+            MINOR=$(echo "$BASE_VER" | cut -d. -f2)
+            BASE_PATCH=$(echo "$BASE_VER" | cut -d. -f3)
+
+            # Find all existing tags matching vMAJOR.MINOR.<number>
+            EXISTING_PATCHES=$(git tag -l "v${MAJOR}.${MINOR}.*" | sed -E "s/^v${MAJOR}\.${MINOR}\.([0-9]+)$/\1/" | grep -E '^[0-9]+$' | sort -n || true)
+
+            if [ -z "$EXISTING_PATCHES" ]; then
+              # First release in this MAJOR.MINOR series (e.g. 0.5.0)
+              PATCH="$BASE_PATCH"
+            else
+              MAX_TAG_PATCH=$(echo "$EXISTING_PATCHES" | tail -n1)
+              NEXT_FROM_TAG=$((MAX_TAG_PATCH + 1))
+              if [ "$BASE_PATCH" -gt "$NEXT_FROM_TAG" ]; then
+                PATCH="$BASE_PATCH"
+              else
+                PATCH="$NEXT_FROM_TAG"
+              fi
+            fi
+
+            VER="${MAJOR}.${MINOR}.${PATCH}"
+            TAG="v${VER}"
+          fi
+
+          MAJOR=$(echo "$VER" | cut -d. -f1)
+          MINOR=$(echo "$VER" | cut -d. -f2)
+          PATCH=$(echo "$VER" | cut -d. -f3)
+          NEXT_PATCH=$((PATCH + 1))
+          NEXT_VER="${MAJOR}.${MINOR}.${NEXT_PATCH}"
+
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "next_version=${NEXT_VER}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: ${VER} (${TAG}), next revision: ${NEXT_VER}"
+
+  # ============================================================================
   # 1. Linux Packages (.deb, .rpm, .tar.gz) — glibc, musl, x86, ARM, RISC-V, PPC
   # ============================================================================
   linux-deb-rpm:
     name: Linux .deb & .rpm (x86_64 glibc + musl)
+    needs: prepare-version
     runs-on: ubuntu-latest
     env:
       CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
@@ -32,6 +97,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Stamp release version into Cargo.toml
+        run: |
+          sed -i 's/^version = ".*"/version = "${{ needs.prepare-version.outputs.version }}"/' Cargo.toml
 
       - name: Install dependencies and packaging tools
         run: |
@@ -85,6 +154,7 @@ jobs:
 
   linux-multiarch:
     name: Linux Multi-Arch & Low-Spec (.tar.gz — ${{ matrix.target }})
+    needs: prepare-version
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -161,6 +231,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Stamp release version into Cargo.toml
+        run: |
+          perl -pi -e 's/^version = ".*"/version = "${{ needs.prepare-version.outputs.version }}"/' Cargo.toml
+
       - name: Install C cross-compilers and linkers
         run: |
           sudo apt-get update
@@ -204,6 +278,7 @@ jobs:
   # ============================================================================
   macos-release:
     name: macOS Release (${{ matrix.target }})
+    needs: prepare-version
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -217,6 +292,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Stamp release version into Cargo.toml
+        run: |
+          perl -pi -e 's/^version = ".*"/version = "${{ needs.prepare-version.outputs.version }}"/' Cargo.toml
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -246,6 +325,7 @@ jobs:
   # ============================================================================
   bsd-release:
     name: BSD Release (${{ matrix.os }} / ${{ matrix.arch }})
+    needs: prepare-version
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -267,6 +347,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Stamp release version into Cargo.toml
+        run: |
+          perl -pi -e 's/^version = ".*"/version = "${{ needs.prepare-version.outputs.version }}"/' Cargo.toml
 
       - name: Start ${{ matrix.os }} VM
         uses: cross-platform-actions/action@v1.7.0
@@ -310,6 +394,7 @@ jobs:
   # ============================================================================
   windows-release:
     name: Windows Release (${{ matrix.label }})
+    needs: prepare-version
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -337,6 +422,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Stamp release version into Cargo.toml
+        shell: bash
+        run: |
+          perl -pi -e 's/^version = ".*"/version = "${{ needs.prepare-version.outputs.version }}"/' Cargo.toml
 
       - name: Install 32-bit/64-bit MinGW-w64 toolchain for GNU targets
         if: matrix.legacy_pe == true
@@ -379,29 +469,25 @@ jobs:
           path: dist/klast-${{ matrix.label }}.zip
 
   # ============================================================================
-  # 5. Aggregate Artifacts & Publish GitHub Release
+  # 5. Aggregate Artifacts, Publish GitHub Release & Auto-Bump Revision
   # ============================================================================
   publish-release:
-    name: Publish GitHub Release
-    needs: [linux-deb-rpm, linux-multiarch, macos-release, bsd-release, windows-release]
+    name: Publish GitHub Release & Bump Next Revision
+    needs:
+      [
+        prepare-version,
+        linux-deb-rpm,
+        linux-multiarch,
+        macos-release,
+        bsd-release,
+        windows-release,
+      ]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Determine release tag name
-        id: release_meta
-        run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            TAG="${{ github.ref_name }}"
-          elif [ -n "${{ inputs.tag_name }}" ]; then
-            TAG="${{ inputs.tag_name }}"
-          else
-            VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-            TAG="v${VER}"
-          fi
-          echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "Publishing release for tag: ${TAG}"
+        with:
+          fetch-depth: 0
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -418,7 +504,21 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.release_meta.outputs.tag_name }}
-          name: "Klast ${{ steps.release_meta.outputs.tag_name }}"
+          tag_name: ${{ needs.prepare-version.outputs.tag_name }}
+          name: "Klast ${{ needs.prepare-version.outputs.tag_name }}"
           files: release-assets/*
           generate_release_notes: true
+
+      - name: Auto-increment Cargo.toml revision for next release
+        if: github.ref_type == 'branch'
+        run: |
+          NEXT_VER="${{ needs.prepare-version.outputs.next_version }}"
+          perl -pi -e "s/^version = \".*\"/version = \"${NEXT_VER}\"/" Cargo.toml
+          perl -pi -e "s/(name = \"klast\"\nversion = )\"[0-9.]+\"/\${1}\"${NEXT_VER}\"/" Cargo.lock
+          if ! git diff --quiet Cargo.toml Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.toml Cargo.lock
+            git commit -m "chore(release): bump version to ${NEXT_VER} [skip ci]"
+            git push origin HEAD:${{ github.ref_name }} || true
+          fi
