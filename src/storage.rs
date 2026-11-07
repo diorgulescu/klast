@@ -190,6 +190,34 @@ pub fn dom_to_markdown(title: &str, url: &str, nodes: &[DomNode]) -> String {
                 }
                 out.push('\n');
             }
+            DomNode::OrderedList(items) => {
+                for (num, item) in items {
+                    let line = spans_to_markdown(item);
+                    if !line.trim().is_empty() {
+                        out.push_str(&format!("{num}. {}\n", line.trim()));
+                    }
+                }
+                out.push('\n');
+            }
+            DomNode::Table { headers, rows } => {
+                if !headers.is_empty() {
+                    let header_cells: Vec<String> = headers
+                        .iter()
+                        .map(|h| spans_to_markdown(h).trim().to_string())
+                        .collect();
+                    let sep_cells: Vec<&str> = headers.iter().map(|_| "---").collect();
+                    out.push_str(&format!("| {} |\n", header_cells.join(" | ")));
+                    out.push_str(&format!("| {} |\n", sep_cells.join(" | ")));
+                    for row in rows {
+                        let row_cells: Vec<String> = row
+                            .iter()
+                            .map(|c| spans_to_markdown(c).trim().to_string())
+                            .collect();
+                        out.push_str(&format!("| {} |\n", row_cells.join(" | ")));
+                    }
+                    out.push('\n');
+                }
+            }
             DomNode::CodeBlock(code) => {
                 out.push_str("```\n");
                 out.push_str(code);
@@ -229,6 +257,8 @@ fn spans_to_markdown(spans: &[InlineSpan]) -> String {
             InlineSpan::Text(t) => buf.push_str(t),
             InlineSpan::Bold(b) => buf.push_str(&format!("**{b}**")),
             InlineSpan::Italic(i) => buf.push_str(&format!("*{i}*")),
+            InlineSpan::BoldItalic(bi) => buf.push_str(&format!("***{bi}***")),
+            InlineSpan::Strikethrough(s) => buf.push_str(&format!("~~{s}~~")),
             InlineSpan::Code(c) => buf.push_str(&format!("`{c}`")),
             InlineSpan::Link { text, href } => buf.push_str(&format!("[{text}]({href})")),
             InlineSpan::ImageBadge { alt, url } => buf.push_str(&format!("[IMG: {alt}]({url})")),

@@ -31,6 +31,7 @@ pub struct FetchResponse {
     pub status_text: String,
     pub html: String,
     pub bytes_received: usize,
+    pub is_markdown: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +253,7 @@ fn perform_request(target_url: &str, smart_redirects: bool) -> FetchResult {
             status_text: "200 OK (Internal)".to_string(),
             html,
             bytes_received,
+            is_markdown: false,
         });
     }
 
@@ -282,7 +284,7 @@ fn perform_request(target_url: &str, smart_redirects: bool) -> FetchResult {
         .get(target_url)
         .header(
             reqwest::header::ACCEPT,
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "text/html,text/markdown,text/plain;q=0.9,application/xhtml+xml,application/xml;q=0.8,*/*;q=0.7",
         )
         .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
         .send()
@@ -302,16 +304,24 @@ fn perform_request(target_url: &str, smart_redirects: bool) -> FetchResult {
         status_code,
         response.status().canonical_reason().unwrap_or("OK")
     );
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let final_url = rewrite_url(response.url().as_str(), smart_redirects);
 
     match response.text() {
         Ok(body) => {
             let bytes_received = body.len();
+            let is_markdown = detect_markdown_document(&final_url, &content_type, &body);
             FetchResult::Success(FetchResponse {
                 final_url,
                 status_text,
                 html: body,
                 bytes_received,
+                is_markdown,
             })
         }
         Err(err) => FetchResult::Error {
@@ -319,6 +329,37 @@ fn perform_request(target_url: &str, smart_redirects: bool) -> FetchResult {
             error: format!("Failed reading response body: {err}"),
         },
     }
+}
+
+/// Determines if a fetched document should be interpreted directly as Markdown.
+pub fn detect_markdown_document(url: &str, content_type: &str, body: &str) -> bool {
+    let path_part = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    if path_part.ends_with(".md")
+        || path_part.ends_with(".markdown")
+        || path_part.ends_with(".mdown")
+        || path_part.ends_with(".mkd")
+    {
+        return true;
+    }
+
+    if content_type.contains("text/markdown") || content_type.contains("text/x-markdown") {
+        return true;
+    }
+
+    let trimmed = body.trim_start();
+    let looks_like_html = trimmed.starts_with("<!")
+        || trimmed.starts_with("<html")
+        || trimmed.starts_with("<HTML")
+        || trimmed.starts_with("<head")
+        || trimmed.starts_with("<body")
+        || trimmed.contains("<div")
+        || trimmed.contains("<p>");
+
+    if !looks_like_html && (content_type.contains("text/plain") || trimmed.starts_with("# ")) {
+        return true;
+    }
+
+    false
 }
 
 fn perform_image_request(image_url: &str) -> FetchResult {

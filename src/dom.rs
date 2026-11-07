@@ -16,6 +16,8 @@ pub enum InlineSpan {
     Text(String),
     Bold(String),
     Italic(String),
+    BoldItalic(String),
+    Strikethrough(String),
     Code(String),
     Link { text: String, href: String },
     ImageBadge { alt: String, url: String },
@@ -42,10 +44,18 @@ pub enum DomNode {
     Heading(u8, String),
     Paragraph(Vec<InlineSpan>),
     List(Vec<Vec<InlineSpan>>),
+    OrderedList(Vec<(usize, Vec<InlineSpan>)>),
+    Table {
+        headers: Vec<Vec<InlineSpan>>,
+        rows: Vec<Vec<Vec<InlineSpan>>>,
+    },
     CodeBlock(String),
     Quote(String),
     Form(FormNode),
-    Image { url: String, alt: String },
+    Image {
+        url: String,
+        alt: String,
+    },
     HorizontalRule,
 }
 
@@ -317,7 +327,7 @@ fn process_block_element(el: ElementRef<'_>, ctx: &mut ParseContext<'_>, out: &m
                 walk_block_container(el, ctx, out);
             }
         }
-        "ul" | "ol" => {
+        "ul" => {
             let mut items: Vec<Vec<InlineSpan>> = Vec::new();
             for child in el.children() {
                 if let Some(child_el) = ElementRef::wrap(child) {
@@ -336,6 +346,34 @@ fn process_block_element(el: ElementRef<'_>, ctx: &mut ParseContext<'_>, out: &m
             }
             if !items.is_empty() {
                 out.push(DomNode::List(items));
+            }
+        }
+        "ol" => {
+            let start_num = el
+                .value()
+                .attr("start")
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(1);
+            let mut items: Vec<(usize, Vec<InlineSpan>)> = Vec::new();
+            let mut idx = start_num;
+            for child in el.children() {
+                if let Some(child_el) = ElementRef::wrap(child) {
+                    if check_and_skip_element(child_el, ctx) {
+                        continue;
+                    }
+                    if child_el.value().name() == "li" {
+                        let mut spans = Vec::new();
+                        collect_inline_spans(child_el, ctx, &mut spans, out);
+                        normalize_spans(&mut spans);
+                        if !spans.is_empty() {
+                            items.push((idx, spans));
+                            idx += 1;
+                        }
+                    }
+                }
+            }
+            if !items.is_empty() {
+                out.push(DomNode::OrderedList(items));
             }
         }
         "p" | "dt" | "dd" | "figcaption" | "summary" => {
@@ -632,6 +670,13 @@ fn collect_inline_spans(
                 spans.push(InlineSpan::Italic(text));
             }
         }
+        "s" | "del" | "strike" => {
+            let text = extract_visible_text(el, ctx.reader_mode);
+            if !text.is_empty() {
+                ensure_space_before_inline(spans);
+                spans.push(InlineSpan::Strikethrough(text));
+            }
+        }
         "code" | "kbd" | "samp" => {
             let text = extract_visible_text(el, ctx.reader_mode);
             if !text.is_empty() {
@@ -750,11 +795,36 @@ fn push_clean_text(spans: &mut Vec<InlineSpan>, raw: &str) {
         piece.push(' ');
     }
 
+    if contains_inline_markdown_syntax(&piece) {
+        let md_spans = parse_markdown_inline(&piece);
+        for md_span in md_spans {
+            match md_span {
+                InlineSpan::Text(t) => {
+                    if let Some(InlineSpan::Text(last)) = spans.last_mut() {
+                        last.push_str(&t);
+                    } else {
+                        spans.push(InlineSpan::Text(t));
+                    }
+                }
+                other => spans.push(other),
+            }
+        }
+        return;
+    }
+
     if let Some(InlineSpan::Text(last)) = spans.last_mut() {
         last.push_str(&piece);
     } else {
         spans.push(InlineSpan::Text(piece));
     }
+}
+
+fn contains_inline_markdown_syntax(s: &str) -> bool {
+    s.contains("**")
+        || s.contains("__")
+        || s.contains("~~")
+        || s.contains('`')
+        || (s.contains('[') && s.contains("]("))
 }
 
 fn ensure_space_before_inline(spans: &mut Vec<InlineSpan>) {
@@ -803,17 +873,25 @@ fn flush_paragraph(spans: &mut Vec<InlineSpan>, out: &mut Vec<DomNode>) {
 }
 
 /// Parses a plain-text Markdown document into a native `Vec<DomNode>` AST.
-/// Supports `#` headings, `- ` / `* ` lists, `> ` quotes, fenced code blocks,
-/// horizontal rules (`---`), and inline `[Title](url)`, `` `code` ``, `**bold**`, and `*italic*`.
+/// Supports ATX (`#`) and Setext (`===`/`---`) headings, `- ` / `* ` / `+ ` unordered lists
+/// (including task lists `- [ ]` / `- [x]`), `1. ` / `1) ` ordered lists, pipe tables,
+/// `> ` blockquotes, fenced code blocks (` ``` ` / `~~~`), horizontal rules (`---`),
+/// and inline `[Title](url)`, `![alt](url)`, `<https://...>`, `` `code` ``,
+/// `***bold italic***`, `**bold**`, `__bold__`, `*italic*`, `_italic_`, and `~~strikethrough~~`.
 pub fn parse_markdown_to_dom(md: &str) -> Vec<DomNode> {
     let mut nodes: Vec<DomNode> = Vec::new();
     let mut in_code_block = false;
+    let mut code_fence = "```";
     let mut code_buf = String::new();
     let mut list_buf: Vec<Vec<InlineSpan>> = Vec::new();
+    let mut ordered_list_buf: Vec<(usize, Vec<InlineSpan>)> = Vec::new();
+    let mut table_lines: Vec<String> = Vec::new();
     let mut quote_buf: Vec<String> = Vec::new();
     let mut para_lines: Vec<String> = Vec::new();
 
     let flush_all = |list_buf: &mut Vec<Vec<InlineSpan>>,
+                     ordered_list_buf: &mut Vec<(usize, Vec<InlineSpan>)>,
+                     table_lines: &mut Vec<String>,
                      quote_buf: &mut Vec<String>,
                      para_lines: &mut Vec<String>,
                      nodes: &mut Vec<DomNode>| {
@@ -828,6 +906,22 @@ pub fn parse_markdown_to_dom(md: &str) -> Vec<DomNode> {
         if !list_buf.is_empty() {
             nodes.push(DomNode::List(std::mem::take(list_buf)));
         }
+        if !ordered_list_buf.is_empty() {
+            nodes.push(DomNode::OrderedList(std::mem::take(ordered_list_buf)));
+        }
+        if !table_lines.is_empty() {
+            let lines = std::mem::take(table_lines);
+            if let Some(table_node) = parse_markdown_table(&lines) {
+                nodes.push(table_node);
+            } else {
+                for line in lines {
+                    let spans = parse_markdown_inline(&line);
+                    if !spans.is_empty() {
+                        nodes.push(DomNode::Paragraph(spans));
+                    }
+                }
+            }
+        }
         if !quote_buf.is_empty() {
             let joined = quote_buf.join(" ");
             quote_buf.clear();
@@ -841,17 +935,31 @@ pub fn parse_markdown_to_dom(md: &str) -> Vec<DomNode> {
         let trimmed_end = raw_line.trim_end();
         let trimmed = trimmed_end.trim_start();
 
-        if trimmed.starts_with("```") {
-            flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
-            if in_code_block {
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            let fence = if trimmed.starts_with("~~~") {
+                "~~~"
+            } else {
+                "```"
+            };
+            if in_code_block && fence == code_fence {
                 let cleaned = code_buf.trim_end_matches('\n').to_string();
                 nodes.push(DomNode::CodeBlock(cleaned));
                 code_buf.clear();
                 in_code_block = false;
-            } else {
+                continue;
+            } else if !in_code_block {
+                flush_all(
+                    &mut list_buf,
+                    &mut ordered_list_buf,
+                    &mut table_lines,
+                    &mut quote_buf,
+                    &mut para_lines,
+                    &mut nodes,
+                );
                 in_code_block = true;
+                code_fence = fence;
+                continue;
             }
-            continue;
         }
 
         if in_code_block {
@@ -861,48 +969,155 @@ pub fn parse_markdown_to_dom(md: &str) -> Vec<DomNode> {
         }
 
         if trimmed.is_empty() {
-            flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
+            flush_all(
+                &mut list_buf,
+                &mut ordered_list_buf,
+                &mut table_lines,
+                &mut quote_buf,
+                &mut para_lines,
+                &mut nodes,
+            );
             continue;
         }
 
-        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
-            flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
+        // Setext heading underline (`===` -> H1, `---` directly under paragraph text -> H2)
+        if !para_lines.is_empty() {
+            if trimmed.len() >= 3 && trimmed.chars().all(|c| c == '=') {
+                let heading_text = para_lines.join(" ");
+                para_lines.clear();
+                nodes.push(DomNode::Heading(1, heading_text));
+                continue;
+            }
+            if trimmed.len() >= 3 && trimmed.chars().all(|c| c == '-') {
+                let heading_text = para_lines.join(" ");
+                para_lines.clear();
+                nodes.push(DomNode::Heading(2, heading_text));
+                continue;
+            }
+        }
+
+        if is_horizontal_rule(trimmed) {
+            flush_all(
+                &mut list_buf,
+                &mut ordered_list_buf,
+                &mut table_lines,
+                &mut quote_buf,
+                &mut para_lines,
+                &mut nodes,
+            );
             nodes.push(DomNode::HorizontalRule);
             continue;
         }
 
+        // ATX Heading (`#`..`######`)
         if trimmed.starts_with('#') {
             let hash_count = trimmed.chars().take_while(|&c| c == '#').count();
             if (1..=6).contains(&hash_count) {
-                let rest = trimmed[hash_count..].trim();
-                if !rest.is_empty() {
-                    flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
-                    nodes.push(DomNode::Heading(hash_count as u8, rest.to_string()));
-                    continue;
+                let after_hashes = &trimmed[hash_count..];
+                if after_hashes.is_empty() || after_hashes.starts_with(char::is_whitespace) {
+                    let rest = after_hashes.trim().trim_end_matches('#').trim();
+                    if !rest.is_empty() {
+                        flush_all(
+                            &mut list_buf,
+                            &mut ordered_list_buf,
+                            &mut table_lines,
+                            &mut quote_buf,
+                            &mut para_lines,
+                            &mut nodes,
+                        );
+                        nodes.push(DomNode::Heading(hash_count as u8, rest.to_string()));
+                        continue;
+                    }
                 }
             }
         }
 
+        // Pipe table rows (`| col1 | col2 |`)
+        if is_markdown_table_row(trimmed) {
+            if !para_lines.is_empty()
+                || !list_buf.is_empty()
+                || !ordered_list_buf.is_empty()
+                || !quote_buf.is_empty()
+            {
+                flush_all(
+                    &mut list_buf,
+                    &mut ordered_list_buf,
+                    &mut table_lines,
+                    &mut quote_buf,
+                    &mut para_lines,
+                    &mut nodes,
+                );
+            }
+            table_lines.push(trimmed.to_string());
+            continue;
+        } else if !table_lines.is_empty() {
+            flush_all(
+                &mut list_buf,
+                &mut ordered_list_buf,
+                &mut table_lines,
+                &mut quote_buf,
+                &mut para_lines,
+                &mut nodes,
+            );
+        }
+
+        // Unordered list (`- `, `* `, `+ `) including task lists (`- [ ]`, `- [x]`)
         if let Some(item_str) = trimmed
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
         {
-            if !para_lines.is_empty() || !quote_buf.is_empty() {
-                flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
+            if !para_lines.is_empty() || !ordered_list_buf.is_empty() || !quote_buf.is_empty() {
+                flush_all(
+                    &mut list_buf,
+                    &mut ordered_list_buf,
+                    &mut table_lines,
+                    &mut quote_buf,
+                    &mut para_lines,
+                    &mut nodes,
+                );
             }
-            let item_spans = parse_markdown_inline(item_str.trim());
+            let normalized_item = normalize_task_list_item(item_str.trim());
+            let item_spans = parse_markdown_inline(&normalized_item);
             if !item_spans.is_empty() {
                 list_buf.push(item_spans);
             }
             continue;
         }
 
+        // Ordered list (`1. `, `2. `, `1) `)
+        if let Some((num, item_str)) = parse_ordered_list_line(trimmed) {
+            if !para_lines.is_empty() || !list_buf.is_empty() || !quote_buf.is_empty() {
+                flush_all(
+                    &mut list_buf,
+                    &mut ordered_list_buf,
+                    &mut table_lines,
+                    &mut quote_buf,
+                    &mut para_lines,
+                    &mut nodes,
+                );
+            }
+            let item_spans = parse_markdown_inline(item_str);
+            if !item_spans.is_empty() {
+                ordered_list_buf.push((num, item_spans));
+            }
+            continue;
+        }
+
+        // Blockquote (`> `)
         if let Some(quote_line) = trimmed
             .strip_prefix("> ")
             .or_else(|| trimmed.strip_prefix('>'))
         {
-            if !para_lines.is_empty() || !list_buf.is_empty() {
-                flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
+            if !para_lines.is_empty() || !list_buf.is_empty() || !ordered_list_buf.is_empty() {
+                flush_all(
+                    &mut list_buf,
+                    &mut ordered_list_buf,
+                    &mut table_lines,
+                    &mut quote_buf,
+                    &mut para_lines,
+                    &mut nodes,
+                );
             }
             let clean_quote = quote_line.trim();
             if !clean_quote.is_empty() {
@@ -911,8 +1126,15 @@ pub fn parse_markdown_to_dom(md: &str) -> Vec<DomNode> {
             continue;
         }
 
-        if !list_buf.is_empty() || !quote_buf.is_empty() {
-            flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
+        if !list_buf.is_empty() || !ordered_list_buf.is_empty() || !quote_buf.is_empty() {
+            flush_all(
+                &mut list_buf,
+                &mut ordered_list_buf,
+                &mut table_lines,
+                &mut quote_buf,
+                &mut para_lines,
+                &mut nodes,
+            );
         }
         para_lines.push(trimmed.to_string());
     }
@@ -922,12 +1144,108 @@ pub fn parse_markdown_to_dom(md: &str) -> Vec<DomNode> {
             code_buf.trim_end_matches('\n').to_string(),
         ));
     }
-    flush_all(&mut list_buf, &mut quote_buf, &mut para_lines, &mut nodes);
+    flush_all(
+        &mut list_buf,
+        &mut ordered_list_buf,
+        &mut table_lines,
+        &mut quote_buf,
+        &mut para_lines,
+        &mut nodes,
+    );
 
     nodes
 }
 
-fn parse_markdown_inline(input: &str) -> Vec<InlineSpan> {
+fn is_horizontal_rule(trimmed: &str) -> bool {
+    if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+        return true;
+    }
+    let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.len() >= 3
+        && (compact.chars().all(|c| c == '-')
+            || compact.chars().all(|c| c == '*')
+            || compact.chars().all(|c| c == '_'))
+}
+
+fn normalize_task_list_item(item: &str) -> String {
+    if let Some(rest) = item.strip_prefix("[ ] ") {
+        format!("☐ {}", rest.trim())
+    } else if let Some(rest) = item
+        .strip_prefix("[x] ")
+        .or_else(|| item.strip_prefix("[X] "))
+    {
+        format!("☑ {}", rest.trim())
+    } else {
+        item.to_string()
+    }
+}
+
+fn parse_ordered_list_line(trimmed: &str) -> Option<(usize, &str)> {
+    let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digit_count == 0 || digit_count > 6 {
+        return None;
+    }
+    let num = trimmed[..digit_count].parse::<usize>().ok()?;
+    let rest = &trimmed[digit_count..];
+    if let Some(item) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
+        let clean = item.trim();
+        if !clean.is_empty() {
+            return Some((num, clean));
+        }
+    }
+    None
+}
+
+fn is_markdown_table_row(trimmed: &str) -> bool {
+    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() >= 3
+}
+
+fn is_table_separator_row(trimmed: &str) -> bool {
+    let inner = trimmed.trim_matches('|').trim();
+    if inner.is_empty() {
+        return false;
+    }
+    inner.split('|').all(|cell| {
+        let c = cell.trim();
+        !c.is_empty() && c.chars().any(|ch| ch == '-') && c.chars().all(|ch| ch == '-' || ch == ':')
+    })
+}
+
+fn split_table_cells(row: &str) -> Vec<Vec<InlineSpan>> {
+    let inner = row
+        .strip_prefix('|')
+        .unwrap_or(row)
+        .strip_suffix('|')
+        .unwrap_or(row);
+    inner
+        .split('|')
+        .map(|cell| parse_markdown_inline(cell.trim()))
+        .collect()
+}
+
+fn parse_markdown_table(lines: &[String]) -> Option<DomNode> {
+    if lines.len() < 2 {
+        return None;
+    }
+    if !is_table_separator_row(&lines[1]) {
+        return None;
+    }
+    let headers = split_table_cells(&lines[0]);
+    if headers.is_empty() {
+        return None;
+    }
+    let mut rows = Vec::new();
+    for row_line in lines.iter().skip(2) {
+        if is_table_separator_row(row_line) {
+            continue;
+        }
+        rows.push(split_table_cells(row_line));
+    }
+    Some(DomNode::Table { headers, rows })
+}
+
+/// Parses inline Markdown formatting into `Vec<InlineSpan>`.
+pub fn parse_markdown_inline(input: &str) -> Vec<InlineSpan> {
     let mut spans: Vec<InlineSpan> = Vec::new();
     let mut text_buf = String::new();
     let chars: Vec<char> = input.chars().collect();
@@ -941,6 +1259,13 @@ fn parse_markdown_inline(input: &str) -> Vec<InlineSpan> {
     };
 
     while i < len {
+        // Escaped character `\*`, `\_`, `\[`, etc.
+        if chars[i] == '\\' && i + 1 < len && is_escapable_markdown_char(chars[i + 1]) {
+            text_buf.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+
         // Check for ![alt](url) image syntax
         if chars[i] == '!' && i + 1 < len && chars[i + 1] == '[' {
             if let Some((alt, url, next_idx)) = try_parse_link(&chars, i + 1) {
@@ -961,15 +1286,40 @@ fn parse_markdown_inline(input: &str) -> Vec<InlineSpan> {
                         url: href,
                     });
                 } else {
-                    spans.push(InlineSpan::Link { text: label, href });
+                    let clean_label = strip_outer_markdown_markers(&label);
+                    spans.push(InlineSpan::Link {
+                        text: clean_label,
+                        href,
+                    });
                 }
                 i = next_idx;
                 continue;
             }
         }
 
-        // Check for `code`
+        // Check for <https://...> or <http://...> autolink
+        if chars[i] == '<' {
+            if let Some((url_str, next_idx)) = try_parse_autolink(&chars, i + 1) {
+                flush_text(&mut text_buf, &mut spans);
+                spans.push(InlineSpan::Link {
+                    text: url_str.clone(),
+                    href: url_str,
+                });
+                i = next_idx;
+                continue;
+            }
+        }
+
+        // Check for `code` (including ``code``)
         if chars[i] == '`' {
+            if i + 1 < len && chars[i + 1] == '`' {
+                if let Some((code_str, next_idx)) = try_parse_multi_delim(&chars, i + 2, '`', 2) {
+                    flush_text(&mut text_buf, &mut spans);
+                    spans.push(InlineSpan::Code(code_str));
+                    i = next_idx;
+                    continue;
+                }
+            }
             if let Some((code_str, next_idx)) = try_parse_delimited(&chars, i + 1, '`') {
                 flush_text(&mut text_buf, &mut spans);
                 spans.push(InlineSpan::Code(code_str));
@@ -978,11 +1328,39 @@ fn parse_markdown_inline(input: &str) -> Vec<InlineSpan> {
             }
         }
 
-        // Check for **bold**
-        if chars[i] == '*' && i + 1 < len && chars[i + 1] == '*' {
-            if let Some((bold_str, next_idx)) = try_parse_double_asterisk(&chars, i + 2) {
+        // Check for ***bold italic*** or ___bold italic___
+        if i + 2 < len
+            && ((chars[i] == '*' && chars[i + 1] == '*' && chars[i + 2] == '*')
+                || (chars[i] == '_' && chars[i + 1] == '_' && chars[i + 2] == '_'))
+        {
+            let delim = chars[i];
+            if let Some((bi_str, next_idx)) = try_parse_multi_delim(&chars, i + 3, delim, 3) {
+                flush_text(&mut text_buf, &mut spans);
+                spans.push(InlineSpan::BoldItalic(bi_str));
+                i = next_idx;
+                continue;
+            }
+        }
+
+        // Check for **bold** or __bold__
+        if i + 1 < len
+            && ((chars[i] == '*' && chars[i + 1] == '*')
+                || (chars[i] == '_' && chars[i + 1] == '_'))
+        {
+            let delim = chars[i];
+            if let Some((bold_str, next_idx)) = try_parse_multi_delim(&chars, i + 2, delim, 2) {
                 flush_text(&mut text_buf, &mut spans);
                 spans.push(InlineSpan::Bold(bold_str));
+                i = next_idx;
+                continue;
+            }
+        }
+
+        // Check for ~~strikethrough~~
+        if i + 1 < len && chars[i] == '~' && chars[i + 1] == '~' {
+            if let Some((strike_str, next_idx)) = try_parse_multi_delim(&chars, i + 2, '~', 2) {
+                flush_text(&mut text_buf, &mut spans);
+                spans.push(InlineSpan::Strikethrough(strike_str));
                 i = next_idx;
                 continue;
             }
@@ -998,12 +1376,88 @@ fn parse_markdown_inline(input: &str) -> Vec<InlineSpan> {
             }
         }
 
+        // Check for _italic_ (only when not inside a snake_case identifier)
+        if chars[i] == '_' {
+            let prev_is_alnum = i > 0 && chars[i - 1].is_alphanumeric();
+            if !prev_is_alnum {
+                if let Some((italic_str, next_idx)) = try_parse_delimited(&chars, i + 1, '_') {
+                    let next_is_alnum = next_idx < len && chars[next_idx].is_alphanumeric();
+                    if !next_is_alnum {
+                        flush_text(&mut text_buf, &mut spans);
+                        spans.push(InlineSpan::Italic(italic_str));
+                        i = next_idx;
+                        continue;
+                    }
+                }
+            }
+        }
+
         text_buf.push(chars[i]);
         i += 1;
     }
 
     flush_text(&mut text_buf, &mut spans);
     spans
+}
+
+fn is_escapable_markdown_char(c: char) -> bool {
+    matches!(
+        c,
+        '\\' | '`'
+            | '*'
+            | '_'
+            | '{'
+            | '}'
+            | '['
+            | ']'
+            | '('
+            | ')'
+            | '#'
+            | '+'
+            | '-'
+            | '.'
+            | '!'
+            | '~'
+            | '|'
+    )
+}
+
+fn strip_outer_markdown_markers(s: &str) -> String {
+    let trimmed = s.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix("**")
+        .and_then(|r| r.strip_suffix("**"))
+    {
+        return inner.to_string();
+    }
+    if let Some(inner) = trimmed
+        .strip_prefix("__")
+        .and_then(|r| r.strip_suffix("__"))
+    {
+        return inner.to_string();
+    }
+    if let Some(inner) = trimmed.strip_prefix('`').and_then(|r| r.strip_suffix('`')) {
+        return inner.to_string();
+    }
+    s.to_string()
+}
+
+fn try_parse_autolink(chars: &[char], start: usize) -> Option<(String, usize)> {
+    for (idx, &ch) in chars.iter().enumerate().skip(start) {
+        if ch == '>' {
+            let candidate: String = chars[start..idx].iter().collect();
+            if (candidate.starts_with("https://") || candidate.starts_with("http://"))
+                && !candidate.chars().any(char::is_whitespace)
+            {
+                return Some((candidate, idx + 1));
+            }
+            return None;
+        }
+        if ch.is_whitespace() {
+            return None;
+        }
+    }
+    None
 }
 
 fn try_parse_link(chars: &[char], start_bracket: usize) -> Option<(String, String, usize)> {
@@ -1036,18 +1490,24 @@ fn try_parse_link(chars: &[char], start_bracket: usize) -> Option<(String, Strin
     let close_p = close_paren?;
 
     let label: String = chars[start_bracket + 1..close_b].iter().collect();
-    let url: String = chars[close_b + 2..close_p].iter().collect();
-    if label.is_empty() || url.trim().is_empty() {
+    let raw_target: String = chars[close_b + 2..close_p].iter().collect();
+    let url = raw_target
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c| c == '<' || c == '>')
+        .to_string();
+    if label.is_empty() || url.is_empty() {
         return None;
     }
-    Some((label, url.trim().to_string(), close_p + 1))
+    Some((label, url, close_p + 1))
 }
 
 fn try_parse_delimited(chars: &[char], start: usize, delimiter: char) -> Option<(String, usize)> {
     for (idx, &ch) in chars.iter().enumerate().skip(start) {
         if ch == delimiter {
             let content: String = chars[start..idx].iter().collect();
-            if !content.is_empty() {
+            if !content.trim().is_empty() {
                 return Some((content, idx + 1));
             }
             return None;
@@ -1056,14 +1516,19 @@ fn try_parse_delimited(chars: &[char], start: usize, delimiter: char) -> Option<
     None
 }
 
-fn try_parse_double_asterisk(chars: &[char], start: usize) -> Option<(String, usize)> {
+fn try_parse_multi_delim(
+    chars: &[char],
+    start: usize,
+    delimiter: char,
+    count: usize,
+) -> Option<(String, usize)> {
     let len = chars.len();
     let mut idx = start;
-    while idx + 1 < len {
-        if chars[idx] == '*' && chars[idx + 1] == '*' {
+    while idx + count <= len {
+        if (0..count).all(|offset| chars[idx + offset] == delimiter) {
             let content: String = chars[start..idx].iter().collect();
-            if !content.is_empty() {
-                return Some((content, idx + 2));
+            if !content.trim().is_empty() {
+                return Some((content, idx + count));
             }
             return None;
         }
@@ -1155,6 +1620,38 @@ mod tests {
         assert!(doc_images_on.nodes.iter().any(|n| matches!(
             n,
             DomNode::Image { url, alt } if url == "https://example.com/img/arch.png" && alt == "Architecture Diagram"
+        )));
+    }
+
+    #[test]
+    fn test_rich_markdown_parsing_tables_lists_and_inline() {
+        let md = r#"
+Main Title
+==========
+
+1. First **bold** step
+2. Second ~~old~~ *new* step with <https://klast.dev>
+
+| Feature | Status |
+| :--- | :---: |
+| Markdown | `Ready` |
+
+- [x] Done task
+- [ ] Pending task
+"#;
+        let nodes = parse_markdown_to_dom(md);
+        assert_eq!(nodes[0], DomNode::Heading(1, "Main Title".to_string()));
+        assert!(nodes.iter().any(|n| matches!(
+            n,
+            DomNode::OrderedList(items) if items.len() == 2 && items[0].0 == 1 && items[1].0 == 2
+        )));
+        assert!(nodes.iter().any(|n| matches!(
+            n,
+            DomNode::Table { headers, rows } if headers.len() == 2 && rows.len() == 1
+        )));
+        assert!(nodes.iter().any(|n| matches!(
+            n,
+            DomNode::List(items) if items.len() == 2
         )));
     }
 }

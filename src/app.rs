@@ -7,7 +7,9 @@
 // (at your option) any later version.
 
 use crate::adblock_filter::AdblockFilter;
-use crate::dom::{parse_html, parse_markdown_to_dom, DomNode, FormNode, InlineSpan};
+use crate::dom::{
+    parse_html, parse_markdown_inline, parse_markdown_to_dom, DomNode, FormNode, InlineSpan,
+};
 use crate::net::{
     build_get_form_url, normalize_input_to_url, rewrite_url, FetchResult, NetworkClient,
 };
@@ -465,6 +467,12 @@ impl KlastApp {
         }
         if self.is_markdown_doc {
             self.dom_nodes = parse_markdown_to_dom(&self.raw_html);
+            if let Some(h_title) = self.dom_nodes.iter().find_map(|n| match n {
+                DomNode::Heading(1, t) | DomNode::Heading(2, t) => Some(t.clone()),
+                _ => None,
+            }) {
+                self.page_title = h_title;
+            }
             return;
         }
 
@@ -518,7 +526,7 @@ impl KlastApp {
             match result {
                 FetchResult::Success(resp) => {
                     self.is_loading = false;
-                    self.is_markdown_doc = false;
+                    self.is_markdown_doc = resp.is_markdown;
                     self.current_url = resp.final_url.clone();
                     self.address_input = resp.final_url;
                     self.bytes_received = resp.bytes_received;
@@ -588,16 +596,16 @@ impl KlastApp {
         let p = self.theme.palette();
         let frame = Frame::none()
             .fill(p.panel_bg)
-            .inner_margin(Margin::symmetric(6.0, 4.0))
+            .inner_margin(Margin::symmetric(8.0, 5.0))
             .stroke(Stroke::new(1.0_f32, p.border));
 
         egui::TopBottomPanel::top("klast_top_toolbar")
-            .exact_height(32.0)
             .frame(frame)
             .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-                ui.horizontal_centered(|ui| {
-                    // Navigation buttons
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+
+                // Row 1: Navigation buttons + full-width Address / Search bar
+                ui.horizontal(|ui| {
                     if ui
                         .add_enabled(self.can_go_back(), egui::Button::new("[ ◀ Back ]"))
                         .on_hover_text("Go back one page")
@@ -622,119 +630,18 @@ impl KlastApp {
                         self.reload();
                     }
 
-                    // Mode Toggles, Bookmarks & Offline Actions aligned right so address bar fills remaining width
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .button("[ ⚡ WebKit Fallback ]")
-                            .on_hover_text(
-                                "Launch current URL in an isolated system WebView subprocess",
-                            )
+                            .button("[ Go ↵ ]")
+                            .on_hover_text("Navigate to URL or search query")
                             .clicked()
                         {
-                            self.spawn_webkit_fallback();
+                            let target = self.address_input.clone();
+                            self.navigate_to(target, true);
                         }
 
-                        let theme_label = format!("[ 🌗 Theme: {} ]", self.theme.label());
-                        if ui
-                            .button(theme_label)
-                            .on_hover_text(
-                                "Cycle between High-Contrast Light, Dark, and Sepia/Paper themes",
-                            )
-                            .clicked()
-                        {
-                            self.theme = self.theme.next();
-                            Self::apply_flat_visuals(ctx, self.theme);
-                        }
-
-                        let img_label = if self.images_enabled {
-                            "[ 🖼️ Images: ON ]"
-                        } else {
-                            "[ 🖼️ Images: OFF ]"
-                        };
-                        if ui
-                            .button(img_label)
-                            .on_hover_text(
-                                "Toggle lazy image loading (OFF renders lightweight [IMG: alt] badges)",
-                            )
-                            .clicked()
-                        {
-                            self.images_enabled = !self.images_enabled;
-                            self.reparse_current_html();
-                        }
-
-                        let redirect_label = if self.smart_redirects {
-                            "[ 🔄 Smart Redirects: ON ]"
-                        } else {
-                            "[ 🔄 Smart Redirects: OFF ]"
-                        };
-                        if ui
-                            .button(redirect_label)
-                            .on_hover_text(
-                                "Rewrite reddit.com -> old.reddit.com, en.wikipedia.org -> en.m.wikipedia.org, and strip tracking params",
-                            )
-                            .clicked()
-                        {
-                            self.smart_redirects = !self.smart_redirects;
-                            if self.smart_redirects {
-                                let rewritten = rewrite_url(&self.current_url, true);
-                                if rewritten != self.current_url {
-                                    self.navigate_to(rewritten, true);
-                                }
-                            }
-                        }
-
-                        let mode_label = if self.reader_mode {
-                            "[ 📖 Reader ]"
-                        } else {
-                            "[ 📖 Full DOM ]"
-                        };
-                        if ui
-                            .button(mode_label)
-                            .on_hover_text(
-                                "Toggle between clean <article>/<main> extraction and full <body>",
-                            )
-                            .clicked()
-                        {
-                            self.reader_mode = !self.reader_mode;
-                            self.reparse_current_html();
-                        }
-
-                        // Offline & Bookmark controls
-                        if ui
-                            .button("[ 📥 Save Offline ]")
-                            .on_hover_text(
-                                "Save current page as plain-text Markdown in ~/.config/klast/archive/",
-                            )
-                            .clicked()
-                        {
-                            self.save_current_page_offline();
-                        }
-
-                        if ui
-                            .button("[ +★ ]")
-                            .on_hover_text("Bookmark current page to ~/.config/klast/bookmarks.md")
-                            .clicked()
-                        {
-                            self.bookmark_current_page();
-                        }
-
-                        if ui
-                            .button("[ ★ Bookmarks ]")
-                            .on_hover_text("Open plain-text Markdown bookmarks & offline reading list")
-                            .clicked()
-                        {
-                            self.navigate_to("about:bookmarks".to_string(), true);
-                        }
-
-                        // Live adblock counter badge
-                        let blocked_badge = format!("[ 🛡️ Blocked: {} ]", self.blocked_count);
-                        ui.add_enabled(false, egui::Button::new(blocked_badge))
-                            .on_disabled_hover_text(
-                                "Number of ad/tracker URLs and cosmetic banner/consent elements stripped on this page",
-                            );
-
-                        // Single-line Address / Search Bar taking up all remaining width
-                        let available_width = ui.available_width().max(90.0);
+                        // Full-width Address / Search Bar on its dedicated row
+                        let available_width = ui.available_width().max(120.0);
                         let response = ui.add_sized(
                             [available_width, 22.0],
                             TextEdit::singleline(&mut self.address_input)
@@ -747,6 +654,133 @@ impl KlastApp {
                             self.navigate_to(target, true);
                         }
                     });
+                });
+
+                // Row 2: Bookmarks, Offline Archive, Mode Toggles & Status Badges
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button("[ ★ Bookmarks ]")
+                        .on_hover_text("Open plain-text Markdown bookmarks & offline reading list")
+                        .clicked()
+                    {
+                        self.navigate_to("about:bookmarks".to_string(), true);
+                    }
+
+                    if ui
+                        .button("[ +★ ]")
+                        .on_hover_text("Bookmark current page to ~/.config/klast/bookmarks.md")
+                        .clicked()
+                    {
+                        self.bookmark_current_page();
+                    }
+
+                    if ui
+                        .button("[ 📥 Save Offline ]")
+                        .on_hover_text(
+                            "Save current page as plain-text Markdown in ~/.config/klast/archive/",
+                        )
+                        .clicked()
+                    {
+                        self.save_current_page_offline();
+                    }
+
+                    let mode_label = if self.reader_mode {
+                        "[ 📖 Reader ]"
+                    } else {
+                        "[ 📖 Full DOM ]"
+                    };
+                    if ui
+                        .button(mode_label)
+                        .on_hover_text(
+                            "Toggle between clean <article>/<main> extraction and full <body>",
+                        )
+                        .clicked()
+                    {
+                        self.reader_mode = !self.reader_mode;
+                        self.reparse_current_html();
+                    }
+
+                    let md_label = if self.is_markdown_doc {
+                        "[ 📝 Markdown: ON ]"
+                    } else {
+                        "[ 📝 Markdown: AUTO ]"
+                    };
+                    if ui
+                        .button(md_label)
+                        .on_hover_text(
+                            "Toggle direct Markdown document interpretation for the current page",
+                        )
+                        .clicked()
+                    {
+                        self.is_markdown_doc = !self.is_markdown_doc;
+                        self.reparse_current_html();
+                    }
+
+                    let redirect_label = if self.smart_redirects {
+                        "[ 🔄 Smart Redirects: ON ]"
+                    } else {
+                        "[ 🔄 Smart Redirects: OFF ]"
+                    };
+                    if ui
+                        .button(redirect_label)
+                        .on_hover_text(
+                            "Rewrite reddit.com -> old.reddit.com, en.wikipedia.org -> en.m.wikipedia.org, and strip tracking params",
+                        )
+                        .clicked()
+                    {
+                        self.smart_redirects = !self.smart_redirects;
+                        if self.smart_redirects {
+                            let rewritten = rewrite_url(&self.current_url, true);
+                            if rewritten != self.current_url {
+                                self.navigate_to(rewritten, true);
+                            }
+                        }
+                    }
+
+                    let img_label = if self.images_enabled {
+                        "[ 🖼️ Images: ON ]"
+                    } else {
+                        "[ 🖼️ Images: OFF ]"
+                    };
+                    if ui
+                        .button(img_label)
+                        .on_hover_text(
+                            "Toggle lazy image loading (OFF renders lightweight [IMG: alt] badges)",
+                        )
+                        .clicked()
+                    {
+                        self.images_enabled = !self.images_enabled;
+                        self.reparse_current_html();
+                    }
+
+                    let theme_label = format!("[ 🌗 Theme: {} ]", self.theme.label());
+                    if ui
+                        .button(theme_label)
+                        .on_hover_text(
+                            "Cycle between High-Contrast Light, Dark, and Sepia/Paper themes",
+                        )
+                        .clicked()
+                    {
+                        self.theme = self.theme.next();
+                        Self::apply_flat_visuals(ctx, self.theme);
+                    }
+
+                    if ui
+                        .button("[ ⚡ WebKit Fallback ]")
+                        .on_hover_text(
+                            "Launch current URL in an isolated system WebView subprocess",
+                        )
+                        .clicked()
+                    {
+                        self.spawn_webkit_fallback();
+                    }
+
+                    // Live adblock counter badge
+                    let blocked_badge = format!("[ 🛡️ Blocked: {} ]", self.blocked_count);
+                    ui.add_enabled(false, egui::Button::new(blocked_badge))
+                        .on_disabled_hover_text(
+                            "Number of ad/tracker URLs and cosmetic banner/consent elements stripped on this page",
+                        );
                 });
             });
     }
@@ -837,13 +871,16 @@ impl KlastApp {
                                         5 => 14.5,
                                         _ => 13.5,
                                     };
-                                    ui.add_space(4.0);
+                                    ui.add_space(if *level <= 2 { 8.0 } else { 4.0 });
                                     ui.label(
                                         RichText::new(text)
                                             .font(FontId::new(size, FontFamily::Proportional))
                                             .strong()
                                             .color(p.fg),
                                     );
+                                    if *level <= 2 {
+                                        ui.separator();
+                                    }
                                 }
                                 DomNode::Paragraph(spans) => {
                                     Self::render_inline_spans(
@@ -892,6 +929,90 @@ impl KlastApp {
                                         });
                                     }
                                 }
+                                DomNode::OrderedList(items) => {
+                                    for (num, item_spans) in items {
+                                        ui.horizontal_top(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(" {num}. "))
+                                                    .font(FontId::new(
+                                                        13.5,
+                                                        FontFamily::Monospace,
+                                                    ))
+                                                    .strong()
+                                                    .color(p.muted_fg),
+                                            );
+                                            Self::render_inline_spans(
+                                                ui,
+                                                item_spans,
+                                                p,
+                                                &mut self.hovered_link,
+                                                &mut clicked_link,
+                                                &mut newly_previewed,
+                                            );
+                                        });
+                                    }
+                                }
+                                DomNode::Table { headers, rows } => {
+                                    Frame::none()
+                                        .fill(p.code_bg)
+                                        .stroke(Stroke::new(1.0_f32, p.border))
+                                        .inner_margin(Margin::symmetric(10.0, 8.0))
+                                        .show(ui, |ui| {
+                                            egui::Grid::new(format!("md_table_{node_idx}"))
+                                                .striped(true)
+                                                .spacing([16.0, 6.0])
+                                                .show(ui, |ui| {
+                                                    for header_cell in headers {
+                                                        ui.horizontal(|ui| {
+                                                            for span in header_cell {
+                                                                match span {
+                                                                    InlineSpan::Text(t)
+                                                                    | InlineSpan::Bold(t)
+                                                                    | InlineSpan::BoldItalic(t) => {
+                                                                        ui.label(
+                                                                            RichText::new(t)
+                                                                                .font(FontId::new(
+                                                                                    14.0,
+                                                                                    FontFamily::Proportional,
+                                                                                ))
+                                                                                .strong()
+                                                                                .color(p.fg),
+                                                                        );
+                                                                    }
+                                                                    other => {
+                                                                        Self::render_inline_spans(
+                                                                            ui,
+                                                                            std::slice::from_ref(
+                                                                                other,
+                                                                            ),
+                                                                            p,
+                                                                            &mut self.hovered_link,
+                                                                            &mut clicked_link,
+                                                                            &mut newly_previewed,
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+                                                    ui.end_row();
+
+                                                    for row in rows {
+                                                        for cell in row {
+                                                            Self::render_inline_spans(
+                                                                ui,
+                                                                cell,
+                                                                p,
+                                                                &mut self.hovered_link,
+                                                                &mut clicked_link,
+                                                                &mut newly_previewed,
+                                                            );
+                                                        }
+                                                        ui.end_row();
+                                                    }
+                                                });
+                                        });
+                                }
                                 DomNode::CodeBlock(code) => {
                                     Frame::none()
                                         .fill(p.code_bg)
@@ -907,17 +1028,30 @@ impl KlastApp {
                                         });
                                 }
                                 DomNode::Quote(quote_text) => {
-                                    ui.horizontal_top(|ui| {
-                                        let (_, rect) = ui.allocate_space(Vec2::new(4.0, 20.0));
-                                        ui.painter().rect_filled(rect, Rounding::ZERO, p.accent);
-                                        ui.add_space(6.0);
-                                        ui.label(
-                                            RichText::new(quote_text)
-                                                .font(FontId::new(14.5, FontFamily::Proportional))
-                                                .italics()
-                                                .color(p.muted_fg),
-                                        );
-                                    });
+                                    let quote_spans = parse_markdown_inline(quote_text);
+                                    Frame::none()
+                                        .fill(p.code_bg)
+                                        .inner_margin(Margin::symmetric(10.0, 6.0))
+                                        .show(ui, |ui| {
+                                            ui.horizontal_top(|ui| {
+                                                let (_, rect) =
+                                                    ui.allocate_space(Vec2::new(4.0, 20.0));
+                                                ui.painter().rect_filled(
+                                                    rect,
+                                                    Rounding::ZERO,
+                                                    p.accent,
+                                                );
+                                                ui.add_space(6.0);
+                                                Self::render_inline_spans(
+                                                    ui,
+                                                    &quote_spans,
+                                                    p,
+                                                    &mut self.hovered_link,
+                                                    &mut clicked_link,
+                                                    &mut newly_previewed,
+                                                );
+                                            });
+                                        });
                                 }
                                 DomNode::Form(form) => {
                                     Frame::none()
@@ -1089,6 +1223,23 @@ impl KlastApp {
                                 .font(FontId::new(14.5, FontFamily::Proportional))
                                 .italics()
                                 .color(p.fg),
+                        );
+                    }
+                    InlineSpan::BoldItalic(text) => {
+                        ui.label(
+                            RichText::new(text)
+                                .font(FontId::new(14.5, FontFamily::Proportional))
+                                .strong()
+                                .italics()
+                                .color(p.fg),
+                        );
+                    }
+                    InlineSpan::Strikethrough(text) => {
+                        ui.label(
+                            RichText::new(text)
+                                .font(FontId::new(14.5, FontFamily::Proportional))
+                                .strikethrough()
+                                .color(p.muted_fg),
                         );
                     }
                     InlineSpan::Code(text) => {
